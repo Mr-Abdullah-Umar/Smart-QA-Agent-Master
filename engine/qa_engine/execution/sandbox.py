@@ -19,12 +19,20 @@ class SandboxedSubprocess:
         "PATH",
         "PYTHONPATH",
         "SYSTEMROOT",
+        "SYSTEMDRIVE",
         "WINDIR",
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
         "TEMP",
         "TMP",
         "USERPROFILE",
+        "USERNAME",
         "HOME",
         "PLAYWRIGHT_BROWSERS_PATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SESSIONNAME",
     }
 
     @classmethod

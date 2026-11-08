@@ -110,7 +110,8 @@ async def main():
     snapshot = await session.navigate("https://the-internet.herokuapp.com/login")
     initial_shot = await session.screenshot("live_login_initial.png")
     print(f" -> Initial page screenshot captured: {initial_shot.name}")
-    await asyncio.sleep(2)
+    print(" -> Displaying exploration window on screen (4 seconds pause)...")
+    await asyncio.sleep(4)
 
     page = session._page
     a11y_violations = await ExtendedChecksCollector.collect_accessibility(page)
@@ -232,20 +233,32 @@ class LoginPage:
         self.page = page
         self.username_input = page.locator("#username")
         self.password_input = page.locator("#password")
-        self.submit_button = page.locator("button[type='submit']")
+        self.submit_button = page.locator("button[type=\\'submit\\']")
         self.flash_message = page.locator("#flash")
 
     def load(self):
         self.page.goto(self.URL)
         expect(self.username_input).to_be_visible()
+        self.page.wait_for_timeout(1500)
 
     def login(self, username: str, password: str):
+        self.username_input.highlight()
+        self.page.wait_for_timeout(1000)
         self.username_input.fill(username)
+        self.page.wait_for_timeout(1000)
+        self.password_input.highlight()
+        self.page.wait_for_timeout(1000)
         self.password_input.fill(password)
+        self.page.wait_for_timeout(1000)
+        self.submit_button.highlight()
+        self.page.wait_for_timeout(1000)
         self.submit_button.click()
+        self.page.wait_for_timeout(2000)
 
     def get_flash_text(self) -> str:
         expect(self.flash_message).to_be_visible()
+        self.flash_message.highlight()
+        self.page.wait_for_timeout(2500)
         return self.flash_message.inner_text()
 '''
     page_file = pages_dir / "login_page.py"
@@ -315,9 +328,11 @@ def test_empty_credentials(page: Page):
         str(test_file),
         f"--junitxml={junit_xml}",
         "-v",
+        "-s",
         "--tb=short",
         "--headed",
-        "--slowmo=1000",
+        "--browser=chromium",
+        "--slowmo=1500",
     ]
 
     extra_env = {"PYTHONPATH": str(store.run_dir / "scripts")}
