@@ -44,8 +44,14 @@ from qa_engine.generation.testcases import TEST_TYPES, TestCaseCollection
 from qa_engine.generation.validator import ScriptValidator
 from qa_engine.investigation.classifier import FailureClassifier
 from qa_engine.investigation.evidence import EvidenceIndex
+from qa_engine.investigation.planner import (
+    InvestigationCache,
+    InvestigationPolicy,
+    investigate_failures,
+)
 from qa_engine.llm.bridge_provider import ExtensionBridgeProvider
 from qa_engine.llm.provider import LLMProvider
+from qa_engine.llm.usage import AIUsageLedger, MeteredLLM, UsageCounter
 from qa_engine.orchestrator.review import ReviewManager
 from qa_engine.orchestrator.rpc import RemoteRPCError, RPCDispatcher, StdioChannel
 from qa_engine.orchestrator.run_store import RunStore, ScopeModel
@@ -69,7 +75,7 @@ from qa_engine.security.ssrf import validate_destination_url
 
 logger = logging.getLogger(__name__)
 
-ENGINE_VERSION = "0.3.0"
+ENGINE_VERSION = "0.4.0"
 SecretResolver = Callable[[SuiteRecord, List[str]], Awaitable[Dict[str, str]]]
 
 UPDATE_SUITE_COMMENTS = (
@@ -86,6 +92,14 @@ def _stamp() -> str:
 def _origin(url: str) -> str:
     parts = urlparse(url)
     return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
 
 
 def _require_approver(params: Dict[str, Any]) -> str:
@@ -141,6 +155,7 @@ class QAEngineServer:
     def _register_handlers(self) -> None:
         handlers = {
             "engine.info": self.handle_engine_info,
+            "ai.usage": self.handle_ai_usage,
             "run.start": self.handle_run_start,
             "run.scope.confirm": self.handle_scope_confirm,
             "run.clarifications.answer": self.handle_clarifications_answer,
@@ -187,6 +202,12 @@ class QAEngineServer:
             "browser_channel": source.get("browser_channel", "chrome"),
             "ai_enabled": bool(source.get("ai_enabled", False)),
             "dry_run": bool(source.get("dry_run", True)),
+            "ai_investigation": bool(source.get("ai_investigation", True)),
+            "ai_max_investigations": _bounded_int(source.get("ai_max_investigations"), 5, 0, 100),
+            "ai_daily_investigation_limit": _bounded_int(
+                source.get("ai_daily_investigation_limit"), 50, 0, 100000
+            ),
+            "ai_reuse_analyses": bool(source.get("ai_reuse_analyses", True)),
         }
 
     @staticmethod
@@ -252,9 +273,14 @@ class QAEngineServer:
                 "suite_update",
                 "suite_delete",
                 "environments",
+                "ai_cost_controls",
             ],
             "test_types": list(TEST_TYPES),
         }
+
+    async def handle_ai_usage(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """AI calls per purpose for today and the last days (from `.qa-harness/ai-usage.json`)."""
+        return AIUsageLedger(params.get("workspace_root") or str(Path.cwd())).summary()
 
     # ------------------------------------------------------------------ new suite design
 
@@ -369,8 +395,11 @@ class QAEngineServer:
         # Stage 2: analysis & clarifications
         await sm.advance_to(Stage.STAGE_2_ANALYSIS, "Analyzing requirement and acceptance criteria")
         if session.design_mode == "ai":
+            design_llm = MeteredLLM(
+                self.llm, "design", ledger=AIUsageLedger(str(store.workspace_root))
+            )
             session.designer = AITestDesigner(
-                self.llm, session.module, scope.start_url, scope.allowed_domains
+                design_llm, session.module, scope.start_url, scope.allowed_domains
             )
             if session.requirement or session.criteria:
                 await self._say("Asking the AI provider to analyze the requirement ...")
@@ -865,17 +894,40 @@ class QAEngineServer:
         evidence_index = EvidenceIndex()
         evidence_index.scan_run_directory(store.run_dir)
         evidence_index.save(store.run_dir / "evidence" / "evidence_index.json")
-        classifier = FailureClassifier(
-            evidence_index=evidence_index, llm=self.llm if options["ai_enabled"] else None
+        ledger = AIUsageLedger(str(store.workspace_root))
+        usage = UsageCounter()
+        investigation_llm = (
+            MeteredLLM(self.llm, "investigation", counter=usage, ledger=ledger)
+            if options["ai_enabled"]
+            else None
         )
-        tc_map = {tc.tc_id: tc for tc in collection.testcases}
-        investigations = []
-        for outcome in summary.outcomes:
-            if outcome.status in ("failed", "flaky"):
-                tc = tc_map.get(outcome.tc_id)
-                investigations.append(
-                    await classifier.investigate_async(outcome, tc.ac_ref if tc else None)
-                )
+        classifier = FailureClassifier(evidence_index=evidence_index, llm=investigation_llm)
+        policy = InvestigationPolicy(
+            ai_enabled=options["ai_investigation"],
+            max_ai_per_run=options["ai_max_investigations"],
+            daily_ai_limit=options["ai_daily_investigation_limit"],
+            reuse_cached=options["ai_reuse_analyses"],
+        )
+        investigations, investigation_stats = await investigate_failures(
+            summary.outcomes,
+            classifier,
+            policy,
+            ledger,
+            InvestigationCache(str(store.workspace_root), policy.cache_ttl_days),
+            slug=record.slug,
+            suite_hash=sm.state.approved_testcases_hash or "",
+            origin=_origin(scope.start_url),
+            run_id=store.run_id,
+            priorities={tc.tc_id: tc.priority.value for tc in collection.testcases},
+            ac_refs={tc.tc_id: tc.ac_ref for tc in collection.testcases},
+        )
+        ai_usage = {**usage.to_dict(), "investigations": investigation_stats}
+        store.write_json_atomic("ai_usage.json", ai_usage)
+        if investigation_stats["limited"]:
+            await self._say(
+                f"{investigation_stats['limited']} failure(s) were classified by rules because "
+                "the AI investigation limit was reached (results are unaffected)."
+            )
 
         await sm.advance_to(Stage.STAGE_10_SIGN_OFF, "Building reports")
         builder = ReportBuilder()
@@ -913,6 +965,7 @@ class QAEngineServer:
             regression_id=regression_id,
             environment=scope.environment,
             target_url=scope.start_url,
+            ai_calls=usage.total_calls,
         )
         SuiteStore(store.workspace_root).record_run(record.slug, run_summary, statuses)
 
@@ -926,6 +979,7 @@ class QAEngineServer:
                     "slug": record.slug,
                     "duration_seconds": run_summary.duration_seconds,
                     "run_dir": str(store.run_dir),
+                    "ai_usage": ai_usage,
                 },
             )
         await sm.advance_to(Stage.COMPLETED, f"{record.module}: {run_type} finished")
@@ -1173,6 +1227,7 @@ class QAEngineServer:
             + (f", only '{tag}' cases" if tag else "")
             + "."
         )
+        ai_calls = 0
         for index, record in enumerate(records, start=1):
             await self._say(f"[{index}/{len(records)}] Running suite **{record.module}** ...")
             previous = suites.latest_results(record.slug)
@@ -1199,6 +1254,7 @@ class QAEngineServer:
                     show_card=False,
                     origin_map=origin_map,
                 )
+                ai_calls += summary.ai_calls
                 current = suites.latest_results(record.slug)
                 delta = compare_statuses(previous, current)
                 report.suites.append(
@@ -1246,6 +1302,7 @@ class QAEngineServer:
                 "totals": report.totals,
                 "suites": [s.model_dump() for s in report.suites],
                 "report_html": str(paths["html"]),
+                "ai_calls": ai_calls,
             },
         )
 

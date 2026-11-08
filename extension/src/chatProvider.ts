@@ -4,6 +4,8 @@
  * the webview and the Python engine. Every human gate is signed with the GitHub account.
  */
 
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
 import { AIService, PROVIDERS, ProviderId } from "./ai/aiService";
 import { EngineClient } from "./engineClient";
@@ -178,8 +180,24 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
             model: String(data.model ?? ""),
             baseUrl: String(data.baseUrl ?? ""),
             azureApiVersion: String(data.azureApiVersion ?? ""),
+            investigationModel: String(data.investigationModel ?? ""),
           });
           break;
+        case "ai.costSave": {
+          const cfg = vscode.workspace.getConfiguration("qaHarness.ai");
+          const target = vscode.ConfigurationTarget.Global;
+          const int = (v: unknown, fallback: number, max: number) => {
+            const n = Math.floor(Number(v));
+            return Number.isFinite(n) ? Math.max(0, Math.min(max, n)) : fallback;
+          };
+          await cfg.update("investigateFailures", data.investigate !== false, target);
+          await cfg.update("reuseAnalyses", data.reuse !== false, target);
+          await cfg.update("maxInvestigationsPerRun", int(data.perRun, 5, 100), target);
+          await cfg.update("dailyInvestigationLimit", int(data.daily, 50, 100000), target);
+          await this.pushState();
+          this.post({ type: "notice", level: "info", text: "AI cost limits saved." });
+          break;
+        }
         case "ai.setKey":
           await this.promptApiKey();
           break;
@@ -552,7 +570,30 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       settings: this.ai.settings(),
       providers: PROVIDERS,
       engineReady: this.engine.isSetUp(),
+      cost: this.costState(),
     });
+  }
+
+  private costState(): Record<string, unknown> {
+    const cfg = vscode.workspace.getConfiguration("qaHarness.ai");
+    let today: Record<string, number> = {};
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) {
+      try {
+        const file = path.join(root, ".qa-harness", "ai-usage.json");
+        const days = JSON.parse(fs.readFileSync(file, "utf-8")).days || {};
+        today = days[new Date().toISOString().slice(0, 10)] || {};
+      } catch {
+        today = {};
+      }
+    }
+    return {
+      investigate: cfg.get<boolean>("investigateFailures", true),
+      reuse: cfg.get<boolean>("reuseAnalyses", true),
+      perRun: cfg.get<number>("maxInvestigationsPerRun", 5),
+      daily: cfg.get<number>("dailyInvestigationLimit", 50),
+      today: { design: today.design || 0, investigation: today.investigation || 0 },
+    };
   }
 
   // ------------------------------------------------------------------ engine -> webview
@@ -570,6 +611,7 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       this.post({ type: "card.show", ...params });
       if (params.card_type === "report_card" || params.card_type === "regression_card") {
         void this.refreshSuites(true);
+        void this.pushState();
       }
     });
   }
@@ -731,11 +773,40 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
           <datalist id="aiModelList"></datalist>
           <button class="btn-secondary" id="btnLoadModels" type="button">Load models</button>
         </div>
+        <div id="aiInvestigationModelRow">
+          <label class="card-label" for="aiInvestigationModel">Failure-analysis model (optional)</label>
+          <input id="aiInvestigationModel" list="aiModelList"
+            placeholder="Empty = same model. Pick a cheaper one to save quota." />
+        </div>
         <div class="action-buttons">
           <button class="btn-primary" id="btnSaveAi" type="button">Save</button>
           <button class="btn-secondary" id="btnTestAi" type="button">Test connection</button>
         </div>
         <div class="ai-status" id="aiStatus"></div>
+      </div>
+
+      <div class="decision-card">
+        <h3>AI cost controls</h3>
+        <p class="muted small">Designing, revising, and repairing suites always uses AI (never
+          limited). Limits apply only to analyzing failed tests during runs; when a limit is reached,
+          failures are classified by rules instead. Pass/fail results and defect sign-off are not
+          affected.</p>
+        <label class="inline-check"><input type="checkbox" id="costInvestigate" /> Analyze failed
+          tests with AI</label>
+        <label class="inline-check"><input type="checkbox" id="costReuse" /> Reuse an earlier analysis
+          when the same test fails the same way (same approved suite and target, 7 days)</label>
+        <div class="row">
+          <label class="card-label" for="costPerRun">Max AI analyses per run</label>
+          <input id="costPerRun" type="number" min="0" max="100" />
+        </div>
+        <div class="row">
+          <label class="card-label" for="costDaily">Max AI analyses per day</label>
+          <input id="costDaily" type="number" min="0" max="100000" />
+        </div>
+        <div class="action-buttons">
+          <button class="btn-primary" id="btnSaveCost" type="button">Save limits</button>
+        </div>
+        <div class="ai-status" id="costUsage"></div>
       </div>
 
       <div class="decision-card">

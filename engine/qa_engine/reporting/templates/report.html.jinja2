@@ -244,6 +244,9 @@
             {% endif %}
           </div>
         </div>
+        <p style="margin: 4px 0; color: var(--text-muted, #64748b); font-size: 0.9em;">
+          Analysis: {{ {"ai": "AI", "reused": "AI (reused in this run)", "cached": "AI (reused from an earlier run)", "rules": "Deterministic rules"}.get(inv.analysis_source, inv.analysis_source) }}{% if inv.analysis_note %} &middot; {{ inv.analysis_note }}{% endif %}
+        </p>
 
         <h4 style="margin: 8px 0 4px 0;">Observed Facts (Verified Evidence):</h4>
         <ul>

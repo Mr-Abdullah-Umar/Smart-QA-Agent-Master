@@ -80,6 +80,14 @@ def _print_card(card_type: str, data: Dict[str, Any]) -> None:
             f"{data.get('failed')} failed, {data.get('flaky')} flaky, "
             f"{data.get('blocked')} blocked"
         )
+        usage = data.get("ai_usage") or {}
+        inv = usage.get("investigations") or {}
+        if any(inv.values()):
+            print(
+                f"Failure analysis: {inv.get('ai', 0)} by AI, {inv.get('reused', 0)} reused, "
+                f"{inv.get('cached', 0)} from earlier runs, {inv.get('rules', 0)} by rules, "
+                f"{inv.get('limited', 0)} by rules (AI limit reached)"
+            )
         print(f"Report: {data.get('report_html')}\n")
     elif card_type == "regression_card":
         totals = data.get("totals", {})
@@ -90,6 +98,7 @@ def _print_card(card_type: str, data: Dict[str, Any]) -> None:
         for suite in data.get("suites", []):
             detail = suite.get("error") or f"{suite['passed']}/{suite['total']}"
             print(f"  {suite['module']}: {suite['status']} ({detail})")
+        print(f"AI calls: {data.get('ai_calls', 0)}")
         print(f"Report: {data.get('report_html')}\n")
 
 
@@ -116,6 +125,10 @@ def _options(args, ai_enabled: bool = False) -> Dict[str, Any]:
         "browser_channel": args.channel,
         "ai_enabled": ai_enabled,
         "dry_run": not getattr(args, "no_dry_run", False),
+        "ai_investigation": args.ai_investigations > 0,
+        "ai_max_investigations": args.ai_investigations,
+        "ai_daily_investigation_limit": args.ai_daily_limit,
+        "ai_reuse_analyses": not args.no_ai_reuse,
     }
 
 
@@ -383,6 +396,23 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--headless", action="store_true", help="Hide the browser")
         p.add_argument("--slowmo", type=int, default=300, help="Delay per action in ms (headed)")
         p.add_argument("--channel", default="chrome", help="chrome, msedge, or '' for Chromium")
+        p.add_argument(
+            "--ai-investigations",
+            type=int,
+            default=5,
+            help="Max failures analyzed by AI per run (0 = rules only; default 5)",
+        )
+        p.add_argument(
+            "--ai-daily-limit",
+            type=int,
+            default=50,
+            help="Max AI failure analyses per day in this workspace (default 50)",
+        )
+        p.add_argument(
+            "--no-ai-reuse",
+            action="store_true",
+            help="Always ask the AI, even for a failure analyzed in an earlier run",
+        )
 
     def design_flags(p):
         p.add_argument("--url", required=True, help="Start URL of the module")

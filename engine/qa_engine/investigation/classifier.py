@@ -9,7 +9,7 @@ Implements Section 8.11 & Appendix B specifications:
 
 import json
 import logging
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from qa_engine.execution.runner import TestCaseOutcome
 from qa_engine.investigation.evidence import EvidenceIndex
@@ -60,12 +60,21 @@ class FailureClassifier:
         self,
         outcome: TestCaseOutcome,
         requirement_ref: Optional[str] = None,
+        note: Optional[str] = None,
     ) -> InvestigationReport:
         """Rule-based root cause analysis (no LLM) for a failed or flaky outcome."""
         failure_id = self._next_failure_id()
-        return self._rule_based(failure_id, outcome) or self._build_heuristic_fallback(
+        report = self._rule_based(failure_id, outcome) or self._build_heuristic_fallback(
             failure_id, outcome
         )
+        if note:
+            report.analysis_note = note
+        return report
+
+    def rule_based(self, outcome: TestCaseOutcome) -> Optional[InvestigationReport]:
+        """Deterministic classification (flaky, environment errors), or None if rules can't tell."""
+        failure_id = self._next_failure_id()
+        return self._rule_based(failure_id, outcome)
 
     async def investigate_async(
         self,
@@ -81,6 +90,8 @@ class FailureClassifier:
             try:
                 report = await self._run_llm_investigation(failure_id, outcome, requirement_ref)
                 if report:
+                    report.analysis_source = "ai"
+                    report.analysis_note = None
                     self._verify_and_sanitize_report(report)
                     self.reports[failure_id] = report
                     return report
@@ -88,7 +99,53 @@ class FailureClassifier:
                 logger.warning(
                     "LLM investigation failed for %s, using fallback: %s", outcome.tc_id, exc
                 )
+                report = self._build_heuristic_fallback(failure_id, outcome)
+                report.analysis_note = "AI analysis failed; classified by rules."
+                return report
         return self._build_heuristic_fallback(failure_id, outcome)
+
+    def reuse(
+        self,
+        outcome: TestCaseOutcome,
+        analysis: Dict[str, Any],
+        source: str,
+        note: str,
+    ) -> InvestigationReport:
+        """Apply an earlier AI classification to this failure, citing this run's evidence only."""
+        failure_id = self._next_failure_id()
+        facts, citations = self._facts_for(outcome)
+        category = FailureCategory(analysis["category"])
+        report = InvestigationReport(
+            failure_id=failure_id,
+            tc_id=outcome.tc_id,
+            category=category,
+            confidence=float(analysis.get("confidence", 0.5)),
+            facts=facts,
+            hypotheses=[
+                InvestigationHypothesis.model_validate(h) for h in analysis.get("hypotheses", [])
+            ],
+            evidence_citations=citations,
+            reproduction_steps=list(analysis.get("reproduction_steps", [])),
+            recommended_action=str(analysis.get("recommended_action", "")),
+            preventive_measure=str(analysis.get("preventive_measure", "")),
+            analysis_source=source,
+            analysis_note=note,
+            requires_human_signoff=category == FailureCategory.PRODUCT_DEFECT,
+        )
+        self.reports[failure_id] = report
+        return report
+
+    def _facts_for(self, outcome: TestCaseOutcome) -> Tuple[List[InvestigationFact], List[str]]:
+        """One fact about this failure, citing evidence of this test (or the run's first item)."""
+        items = self.evidence_index.items
+        ev_id = next(
+            (i for i, item in items.items() if outcome.tc_id.lower() in item.description.lower()),
+            next(iter(items), None),
+        )
+        if ev_id is None:
+            return [], []
+        statement = f"Test failed with message: {(outcome.error_message or 'N/A')[:200]}"
+        return [InvestigationFact(statement=statement, evidence_id=ev_id)], [ev_id]
 
     def _rule_based(
         self, failure_id: str, outcome: TestCaseOutcome
@@ -165,6 +222,7 @@ class FailureClassifier:
             ],
             recommended_action="Replace loose timeouts with web-first Playwright expect locators.",
             preventive_measure="Enforce strict locator waiting and eliminate race conditions.",
+            analysis_source="rules",
             requires_human_signoff=False,
         )
         self.reports[failure_id] = report
@@ -205,6 +263,7 @@ class FailureClassifier:
             reproduction_steps=[f"Execute {outcome.tc_id} against target server"],
             recommended_action="Check application logs and verify backend container health.",
             preventive_measure="Add automated smoke tests before running full QA harness.",
+            analysis_source="rules",
             requires_human_signoff=False,
         )
         self.reports[failure_id] = report
@@ -256,6 +315,7 @@ class FailureClassifier:
             reproduction_steps=[f"Run pytest for {outcome.tc_id}"],
             recommended_action=rec,
             preventive_measure="Keep Page Object locators synchronized with ARIA roles.",
+            analysis_source="rules",
             requires_human_signoff=(category == FailureCategory.PRODUCT_DEFECT),
         )
         self.reports[failure_id] = report

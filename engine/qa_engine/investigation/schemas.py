@@ -45,6 +45,11 @@ class InvestigationReport(BaseModel):
     recommended_action: str
     preventive_measure: str
 
+    # How the classification was produced: "ai", "reused" (same error earlier in this run),
+    # "cached" (same test, error, and approved suite in an earlier run), or "rules".
+    analysis_source: str = "ai"
+    analysis_note: Optional[str] = None
+
     # Gate 2 controls: Product defect must be explicitly signed off by human
     requires_human_signoff: bool = False
     gate_2_signed_off: bool = False

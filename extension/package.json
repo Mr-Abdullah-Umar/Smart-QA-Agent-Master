@@ -2,7 +2,7 @@
   "name": "ai-qa-testing-harness",
   "displayName": "AI QA Testing Harness",
   "description": "Requirement-driven test suites, retesting, and regression with Playwright, GitHub Copilot, or your own AI provider",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "qa-engineering",
   "license": "UNLICENSED",
   "engines": {
@@ -86,6 +86,34 @@
           "type": "string",
           "default": "2024-10-21",
           "description": "Azure OpenAI REST api-version."
+        },
+        "qaHarness.ai.investigationModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional cheaper model (or Azure deployment) used only to analyze failed tests. Empty uses the main model; if this model fails, the main model is used."
+        },
+        "qaHarness.ai.investigateFailures": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analyze failed tests with AI. When off, failures are classified by deterministic rules (results are unaffected)."
+        },
+        "qaHarness.ai.maxInvestigationsPerRun": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Max failed tests analyzed by AI per run (highest priority first). Identical errors share one analysis. Suite design is never limited."
+        },
+        "qaHarness.ai.dailyInvestigationLimit": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "description": "Max AI failure analyses per day in this workspace (shared by panel and CLI runs). Beyond it, failures are classified by rules."
+        },
+        "qaHarness.ai.reuseAnalyses": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reuse an AI analysis from the last 7 days when the same test fails with the same error on the same approved suite and target."
         },
         "qaHarness.enginePath": {
           "type": "string",

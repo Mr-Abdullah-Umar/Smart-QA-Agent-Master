@@ -43,15 +43,33 @@ function testcase(ac, i, titleSuffix, id, broken = false) {
   };
 }
 
-/** Two valid cases; `extra` appends a third case for AC-2, optionally with a broken locator. */
+/** Two valid cases; `extra` appends more AC-2 cases (default one), optionally with a broken locator. */
 function designReply(titleSuffix, keepIds = [], extra = null) {
   const testcases = ["AC-1", "AC-2"].map((ac, i) => testcase(ac, i, titleSuffix, keepIds[i]));
-  if (extra) testcases.push(testcase("AC-2", 1, `${titleSuffix} extra`, keepIds[2], extra.broken));
+  for (let n = 0; extra && n < (extra.count || 1); n++) {
+    testcases.push(testcase("AC-2", 1, `${titleSuffix} extra ${n + 1}`, keepIds[2 + n], extra.broken));
+  }
   return JSON.stringify({ testcases });
+}
+
+function investigationReply() {
+  return JSON.stringify({
+    failure_id: "x",
+    tc_id: "x",
+    category: "Automation issue",
+    confidence: 0.8,
+    facts: [{ statement: "The button was not found", evidence_id: "EV-001" }],
+    hypotheses: [{ hypothesis: "The locator does not exist on the page", supporting_indicators: [] }],
+    evidence_citations: ["EV-001"],
+    reproduction_steps: ["Open the start page"],
+    recommended_action: "Fix the locator",
+    preventive_measure: "Use the dry run",
+  });
 }
 
 function scriptedLlm(params) {
   const prompt = (params.messages || []).map((m) => m.content).join("\n");
+  if (prompt.includes("Investigate test failure for")) return investigationReply();
   if (prompt.includes("Ask at most 5 clarification questions")) {
     return JSON.stringify({
       summary: "Start page must load and stay on the domain.",
@@ -68,6 +86,7 @@ function scriptedLlm(params) {
       return designReply("(repaired)", ids, { broken: false });
     }
     if (prompt.includes("were updated")) return designReply("(updated)", ids);
+    if (prompt.includes("TWO BROKEN")) return designReply("(costly)", ids, { broken: true, count: 2 });
     return designReply("(revised)", ids, { broken: true });
   }
   return designReply("(v1)");
@@ -92,8 +111,10 @@ async function main() {
 
   const rpc = new RPCClient(child.stdin, child.stdout, 120000);
   let llmCalls = 0;
+  const purposes = { design: 0, investigation: 0 };
   rpc.onRequest("llm.chat", async (params) => {
     llmCalls += 1;
+    purposes[params.purpose] = (purposes[params.purpose] || 0) + 1;
     return { content: scriptedLlm(params), model: "scripted/test" };
   });
   rpc.onRequest("secrets.resolve", async () => ({ values: {} }));
@@ -215,6 +236,57 @@ async function main() {
     });
     const reg = await regression;
 
+    // Cost controls: two cases fail with the same error -> one AI analysis, one reuse;
+    // retesting them reuses the stored analyses -> no AI call.
+    const costScope = waitCard("scope_card");
+    await call("run.start", {
+      module: "Cost Module",
+      start_url: targetUrl,
+      environment: "test",
+      requirement_text: "The start page is reachable.",
+      acceptance_criteria: "Start page loads\nUser stays on the domain",
+      design_mode: "ai",
+      ...options,
+    });
+    const costScopeData = await costScope;
+    const costClarify = waitCard("clarification_card");
+    await call("run.scope.confirm", {
+      approver,
+      scope: { ...costScopeData, environment: "test", authorized_attestation: true },
+    });
+    const costQuestions = await costClarify;
+    const costReview1 = waitCard("review_card");
+    await call("run.clarifications.answer", {
+      approver,
+      answers: { [costQuestions.questions[0].question_id]: "Chrome" },
+    });
+    await costReview1;
+    const costReview2 = waitCard("review_card");
+    await call("run.testcases.revise", { approver, comments: "Add TWO BROKEN cases." });
+    const costV2 = await costReview2;
+    const costDry = waitCard("dry_run_card");
+    await call("run.testcases.approve", { approver, version: costV2.version, sha256_hash: costV2.sha256_hash });
+    const costDryData = await costDry;
+    const investigationsBefore = purposes.investigation;
+    const costReport = waitCard("report_card");
+    await call("run.dryrun.decide", { approver, decision: "run" });
+    const costRun = await costReport;
+    const firstRunInvestigations = purposes.investigation - investigationsBefore;
+    const costSlug = (await call("suites.list", {})).suites.find((s) => s.module === "Cost Module").slug;
+    const costRetest = waitCard("report_card");
+    await call("suite.retest", {
+      slug: costSlug,
+      approver,
+      failed_only: true,
+      authorized_attestation: true,
+      ...options,
+    });
+    const costRetestData = await costRetest;
+    const retestInvestigations = purposes.investigation - investigationsBefore - firstRunInvestigations;
+    const usage = await call("ai.usage", {});
+    const costHtml = fs.readFileSync(costRun.report_html, "utf-8");
+    await call("suite.delete", { slug: costSlug, approver });
+
     const deleted = await call("suite.delete", { slug, approver });
     const afterDelete = await call("suites.list", {});
 
@@ -240,6 +312,20 @@ async function main() {
       "staging environment was saved": afterRetest.environments.staging === targetUrl,
       "smoke regression on staging ran only the 1 smoke case":
         reg.totals.total === 1 && reg.environment === "staging",
+      "dry run flagged both broken cases": costDryData.issues.length === 2,
+      "run anyway: broken cases failed, valid cases passed": costRun.failed === 2 && costRun.passed === 2,
+      "same error twice -> 1 AI analysis + 1 reuse":
+        firstRunInvestigations === 1 &&
+        costRun.ai_usage.investigations.ai === 1 &&
+        costRun.ai_usage.investigations.reused === 1,
+      "report shows how each failure was analyzed": /Analysis:\s*AI \(reused in this run\)/.test(costHtml),
+      "retest of the same failures used no AI":
+        retestInvestigations === 0 &&
+        costRetestData.failed === 2 &&
+        costRetestData.ai_usage.investigations.cached === 2,
+      "usage ledger counted design and investigation calls":
+        usage.today.investigation === 1 && usage.today.design >= 5,
+      "design calls are tagged as design": purposes.design === llmCalls - purposes.investigation,
       "delete archived the suite": deleted.status === "archived" && afterDelete.suites.length === 0,
       "AI used for analysis, design, revision and repair": llmCalls >= 5,
     };

@@ -112,8 +112,10 @@
       $("aiModel").value = s.model;
       $("aiBaseUrl").value = s.baseUrl;
       $("aiAzureVersion").value = s.azureApiVersion;
+      $("aiInvestigationModel").value = s.investigationModel || "";
     }
     applyProviderLayout();
+    renderCost();
     const ai = state.ai;
     if (ai) {
       const status = $("aiStatus");
@@ -133,6 +135,11 @@
     $("aiAzureRow").hidden = id !== "azure-openai";
     const modelDisabled = id === "none";
     $("aiModel").disabled = modelDisabled;
+    $("aiInvestigationModelRow").hidden = modelDisabled;
+    $("aiInvestigationModel").placeholder =
+      id === "azure-openai"
+        ? "Empty = same deployment. A cheaper deployment saves quota."
+        : "Empty = same model. Pick a cheaper one to save quota.";
     $("btnLoadModels").disabled = modelDisabled || id === "azure-openai";
     $("aiModel").placeholder =
       id === "copilot"
@@ -149,11 +156,42 @@
       model: $("aiModel").value.trim(),
       baseUrl: $("aiBaseUrl").value.trim(),
       azureApiVersion: $("aiAzureVersion").value.trim(),
+      investigationModel: $("aiInvestigationModel").value.trim(),
     });
   }
 
+  let costFormLoaded = false;
+  function renderCost() {
+    const c = state.cost;
+    if (!c) return;
+    if (!costFormLoaded) {
+      costFormLoaded = true;
+      $("costInvestigate").checked = c.investigate;
+      $("costReuse").checked = c.reuse;
+      $("costPerRun").value = c.perRun;
+      $("costDaily").value = c.daily;
+    }
+    const used = c.today.investigation;
+    const atLimit = c.investigate && used >= c.daily;
+    $("costUsage").textContent =
+      `Today: ${c.today.design} design call(s), ${used} of ${c.daily} failure analyses` +
+      (atLimit ? " - daily limit reached, failures are classified by rules." : ".");
+    $("costUsage").className = `ai-status ${atLimit ? "warn" : "ok"}`;
+  }
+
+  $("btnSaveCost").addEventListener("click", () => {
+    costFormLoaded = false;
+    post("ai.costSave", {
+      investigate: $("costInvestigate").checked,
+      reuse: $("costReuse").checked,
+      perRun: Number($("costPerRun").value),
+      daily: Number($("costDaily").value),
+    });
+  });
+
   $("aiProvider").addEventListener("change", () => {
     $("aiModel").value = "";
+    $("aiInvestigationModel").value = "";
     $("aiModelList").innerHTML = "";
     applyProviderLayout();
     saveAi();
@@ -488,7 +526,22 @@
 
   function renderReportCard(card, data) {
     const failed = Number(data.failed || 0) + Number(data.blocked || 0);
-    const label = { initial: "Run", retest: "Retest", "retest-failed": "Retest (failed only)" }[data.run_type] || "Run";
+    const label =
+      { initial: "Run", update: "Updated suite run", retest: "Retest", "retest-failed": "Retest (failed only)" }[data.run_type] ||
+      "Run";
+    const inv = (data.ai_usage && data.ai_usage.investigations) || {};
+    const analysed = ["ai", "reused", "cached", "rules", "limited"].reduce((n, k) => n + Number(inv[k] || 0), 0);
+    const analysis = analysed
+      ? [
+          inv.ai ? `${inv.ai} by AI` : "",
+          inv.reused ? `${inv.reused} reused (same error)` : "",
+          inv.cached ? `${inv.cached} reused from earlier runs` : "",
+          inv.rules ? `${inv.rules} by rules` : "",
+          inv.limited ? `${inv.limited} by rules (AI limit reached)` : "",
+        ]
+          .filter(Boolean)
+          .join(", ")
+      : "";
     card.innerHTML = `
       <h3>${failed > 0 ? "&#10060;" : "&#9989;"} ${escapeHtml(label)} complete &middot; ${escapeHtml(data.module)}</h3>
       <div class="result-grid">
@@ -500,6 +553,7 @@
       </div>
       ${(data.failed_tc_ids || []).length ? `<div class="card-field"><span class="card-label">Not passing</span><div class="card-value">${escapeHtml(data.failed_tc_ids.join(", "))}</div></div>` : ""}
       ${data.environment ? `<div class="card-field"><span class="card-label">Environment</span><div class="card-value">${escapeHtml(data.environment)} &middot; ${escapeHtml(data.target_url)}</div></div>` : ""}
+      ${analysis ? `<div class="card-field"><span class="card-label">Failure analysis</span><div class="card-value">${escapeHtml(analysis)}</div></div>` : ""}
       <div class="card-field"><span class="card-label">Duration</span><div class="card-value">${escapeHtml(data.duration_seconds)} s &middot; by ${escapeHtml(data.triggered_by)}</div></div>
       <div class="action-buttons">
         <button class="btn-primary" id="btnOpenReport">Open HTML Report</button>
@@ -533,6 +587,7 @@
         <div><span class="card-label">Blocked</span><div class="card-value">${escapeHtml(t.blocked)}</div></div>
       </div>
       <table class="tc-table"><thead><tr><th>Suite</th><th>Status</th><th>Passed</th><th>Newly failing</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted small">AI calls for failure analysis: ${escapeHtml(data.ai_calls || 0)}</p>
       <div class="action-buttons"><button class="btn-primary" id="btnOpenReg">Open Regression Report</button></div>`;
     card.querySelector("#btnOpenReg").addEventListener("click", () => post("openReport", { path: data.report_html }));
   }

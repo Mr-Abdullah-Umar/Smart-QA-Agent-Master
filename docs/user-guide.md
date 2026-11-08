@@ -1,4 +1,4 @@
-# AI QA Testing Harness - User Guide (v0.3.0)
+# AI QA Testing Harness - User Guide (v0.4.0)
 
 Write a requirement and its acceptance criteria, and the harness designs a **test suite** for that
 module, lets you review and approve it, generates Playwright tests, runs them in a real browser, and
@@ -20,7 +20,7 @@ and AI model comes from you at run time.
 
 1. Install the extension package:
    ```bash
-   code --install-extension extension/ai-qa-testing-harness-0.3.0.vsix
+   code --install-extension extension/ai-qa-testing-harness-0.4.0.vsix
    ```
 2. Open the folder you want to keep test suites in (VS Code must trust the folder).
 3. Click the **QA Harness** beaker in the Activity Bar.
@@ -52,6 +52,41 @@ folder in the open workspace, then the copy bundled inside the extension. Python
 Keys are stored in VS Code's encrypted SecretStorage (the OS keychain). They are never written to
 files, logs, or prompts. Custom endpoints must use HTTPS. Models that do not accept a `temperature`
 setting (some reasoning models) are retried automatically without it.
+
+### AI cost controls
+
+AI is used in two places:
+
+* **Designing suites** (requirement analysis, page choice, design, revisions, dry-run repair): a handful
+  of calls per suite version. These are **never limited**, because a half-designed suite would be worse
+  than the cost. Retests and regressions do not redesign, so they make no design calls.
+* **Analyzing failed tests** after a run: this is the part that grows with nightly or repeated runs, and
+  the only part the limits apply to. Each failure is handled the cheapest way that is still correct:
+  1. **Rules** first: flaky tests (passed on retry) and server or connection errors need no AI.
+  2. **Same error in this run**: when several tests fail with the same specific error (for example the
+     same missing button), one AI analysis is shared by all of them.
+  3. **Same failure as an earlier run**: when the same test fails with the same error on the same
+     approved suite version and target within 7 days, the earlier analysis is reused.
+  4. **AI analysis**, highest-priority cases first, up to the per-run and daily limits.
+  5. Beyond the limits, failures are classified by rules and the report says the limit was reached.
+
+Limits never change results: pass/fail counts, retests, regressions, and Gate 2 (every product defect
+needs your sign-off) work exactly the same. Reused analyses cite only evidence from the current run,
+and every analysis in the report says how it was produced (AI, reused, earlier run, or rules).
+
+Set the limits in the **AI cost controls** card of the AI Provider tab, which also shows today's usage:
+
+| Setting | Default | Meaning |
+| :--- | :--- | :--- |
+| Analyze failed tests with AI (`qaHarness.ai.investigateFailures`) | on | Off = rules only |
+| Max AI analyses per run (`qaHarness.ai.maxInvestigationsPerRun`) | 5 | Distinct failures analyzed by AI per run |
+| Max AI analyses per day (`qaHarness.ai.dailyInvestigationLimit`) | 50 | Shared by panel and CLI runs in the workspace |
+| Reuse earlier analyses (`qaHarness.ai.reuseAnalyses`) | on | Off = always ask the AI |
+| Failure-analysis model (`qaHarness.ai.investigationModel`) | empty | A cheaper model just for failure analysis. If it fails, the main model is used |
+
+With GitHub Copilot, pick a model that your plan includes without premium requests as the
+failure-analysis model, and keep the stronger model for design. Usage per day is kept in
+`.qa-harness/ai-usage.json`; each run's usage is in its `ai_usage.json` and on the report card.
 
 ## 4. Approver identity
 
@@ -190,6 +225,10 @@ The CLI's AI provider is configured with environment variables (the key never go
 | `QA_AI_MODEL` | Model ID (Azure: deployment name; GitHub Models: e.g. `openai/gpt-4.1`) |
 | `QA_AI_BASE_URL` | HTTPS endpoint; required for `azure-openai` and `openai-compatible` |
 | `QA_AI_AZURE_API_VERSION` | Azure REST api-version (default `2024-10-21`) |
+| `QA_AI_INVESTIGATION_MODEL` | Optional cheaper model used only for failure analysis |
+
+Cost controls (see [AI cost controls](#ai-cost-controls)): `--ai-investigations <n>` (per run, default 5,
+`0` = rules only), `--ai-daily-limit <n>` (default 50), `--no-ai-reuse`.
 
 Other options: `--domains`, `--headless`, `--slowmo <ms>`, `--channel chrome|msedge`, `--no-dry-run`.
 `--yes` records your authorization attestation. Secrets come from `QA_SECRET_<NAME>` environment variables.
@@ -213,3 +252,5 @@ Exit codes: `0` all passed, `3` test failures, `2` error, `1` cancelled.
 | `.qa-harness/runs/<run-id>/` | Per-run scripts, `dry_run.json`, evidence (screenshots, traces), `audit.jsonl`, and `report/` (HTML, MD, JSON, JUnit) |
 | `.qa-harness/regressions/<id>/` | Combined regression reports |
 | `.qa-harness/archive/suites/` | Deleted suites and `archive-log.json` |
+| `.qa-harness/ai-usage.json` | AI calls per day (design and failure analysis), last 30 days |
+| `.qa-harness/cache/investigations.json` | Reusable failure analyses (7 days, max 500) |

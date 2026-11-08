@@ -61,6 +61,7 @@ class SuiteRunSummary(BaseModel):
     regression_id: Optional[str] = None
     environment: str = ""
     target_url: str = ""
+    ai_calls: int = 0
 
 
 class SuiteApproval(BaseModel):

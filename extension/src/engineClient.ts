@@ -23,6 +23,17 @@ function venvPython(dir: string): string {
   return IS_WINDOWS ? path.join(dir, "Scripts", "python.exe") : path.join(dir, "bin", "python");
 }
 
+/** Failure-investigation limits sent with every run (design calls are never limited). */
+export function aiCostOptions(config: { get<T>(key: string, fallback: T): T }): Record<string, unknown> {
+  const max = Math.max(0, Math.floor(config.get<number>("ai.maxInvestigationsPerRun", 5)));
+  return {
+    ai_investigation: config.get<boolean>("ai.investigateFailures", true) && max > 0,
+    ai_max_investigations: max,
+    ai_daily_investigation_limit: Math.max(0, Math.floor(config.get<number>("ai.dailyInvestigationLimit", 50))),
+    ai_reuse_analyses: config.get<boolean>("ai.reuseAnalyses", true),
+  };
+}
+
 export class EngineClient {
   private process: ChildProcess | null = null;
   private rpcClient: RPCClient | null = null;
@@ -183,6 +194,7 @@ export class EngineClient {
       headed: config.get<boolean>("headed", true),
       slowmo_ms: config.get<number>("slowMoMs", 500),
       browser_channel: config.get<string>("browserChannel", "chrome"),
+      ...aiCostOptions(config),
     };
   }
 

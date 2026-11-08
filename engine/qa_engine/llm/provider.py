@@ -46,6 +46,16 @@ class LLMProvider(ABC):
         """Execute a non-streaming turn with the model."""
         pass
 
+    async def chat_with_purpose(
+        self,
+        purpose: str,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[ToolDefinition]] = None,
+        temperature: float = 0.2,
+    ) -> LLMResponse:
+        """Like `chat`; providers may route a purpose (e.g. "investigation") to another model."""
+        return await self.chat(messages, tools, temperature)
+
     @abstractmethod
     async def stream_chat(
         self,

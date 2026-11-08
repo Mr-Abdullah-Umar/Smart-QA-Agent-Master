@@ -107,7 +107,11 @@ export interface AiSettings {
   model: string;
   baseUrl: string;
   azureApiVersion: string;
+  /** Optional cheaper model for failure investigation; empty = same as `model`. */
+  investigationModel: string;
 }
+
+export type ChatPurpose = "design" | "investigation";
 
 export interface AiStatus {
   provider: ProviderId;
@@ -157,6 +161,7 @@ export class AIService {
       model: cfg.get<string>("model", "").trim(),
       baseUrl: cfg.get<string>("baseUrl", "").trim().replace(/\/+$/, ""),
       azureApiVersion: cfg.get<string>("azureApiVersion", "2024-10-21").trim(),
+      investigationModel: cfg.get<string>("investigationModel", "").trim(),
     };
   }
 
@@ -168,6 +173,9 @@ export class AIService {
     if (next.baseUrl !== undefined) await cfg.update("baseUrl", next.baseUrl, target);
     if (next.azureApiVersion !== undefined) {
       await cfg.update("azureApiVersion", next.azureApiVersion, target);
+    }
+    if (next.investigationModel !== undefined) {
+      await cfg.update("investigationModel", next.investigationModel, target);
     }
     this.changeEmitter.fire();
   }
@@ -269,9 +277,28 @@ export class AIService {
   public async chat(
     messages: ChatMessage[],
     temperature = 0.2,
-    token?: vscode.CancellationToken
+    token?: vscode.CancellationToken,
+    purpose: ChatPurpose = "design"
   ): Promise<{ content: string; model: string }> {
     const s = this.settings();
+    const cheaper = purpose === "investigation" ? s.investigationModel : "";
+    if (cheaper && cheaper !== s.model) {
+      try {
+        return await this.chatWith(messages, temperature, { ...s, model: cheaper }, token);
+      } catch (e) {
+        // A missing or failing cheaper model must not lower analysis quality: use the main model.
+        console.warn(`Investigation model '${cheaper}' failed, using '${s.model}': ${e}`);
+      }
+    }
+    return this.chatWith(messages, temperature, s, token);
+  }
+
+  private async chatWith(
+    messages: ChatMessage[],
+    temperature: number,
+    s: AiSettings,
+    token?: vscode.CancellationToken
+  ): Promise<{ content: string; model: string }> {
     switch (s.provider) {
       case "copilot":
         return this.chatCopilot(messages, s, token);
@@ -298,7 +325,13 @@ export class AIService {
     if (!models.length) {
       throw new Error("GitHub Copilot is not available. Install Copilot Chat and sign in.");
     }
-    const model = models.find((m) => m.id === s.model) || models[0];
+    let model = models.find((m) => m.id === s.model);
+    if (!model) {
+      if (s.model && s.model !== this.settings().model) {
+        throw new Error(`Copilot model '${s.model}' is not available.`);
+      }
+      model = models[0];
+    }
 
     // The LM API has no system role: fold system prompts into the first user turn.
     const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");

@@ -28,7 +28,8 @@ export function activate(context: vscode.ExtensionContext): void {
   engine.handleRequest("llm.chat", async (params) => {
     const messages = (params.messages as ChatMessage[]) || [];
     const temperature = typeof params.temperature === "number" ? params.temperature : 0.2;
-    return ai.chat(messages, temperature);
+    const purpose = params.purpose === "investigation" ? "investigation" : "design";
+    return ai.chat(messages, temperature, undefined, purpose);
   });
   engine.handleRequest("secrets.resolve", (params) => panel.resolveSecrets(params));
 

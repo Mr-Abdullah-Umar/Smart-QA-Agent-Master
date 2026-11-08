@@ -19,6 +19,9 @@ browser, and keep it for retesting and regression.
   negative, boundary, ui, accessibility) and environment, with a combined report of newly failing and fixed cases.
 - **AI providers**: GitHub Copilot through VS Code with no key, or OpenAI, Azure OpenAI, Anthropic, Gemini,
   GitHub Models, or any OpenAI-compatible HTTPS endpoint with an API key, all from the **AI Provider** tab.
+- **AI cost controls**: suite design is never limited; failure analysis uses rules first, shares one
+  analysis across identical errors, reuses earlier analyses of the same failure, and stays within per-run
+  and daily limits (optionally on a cheaper model). Limits never change test results.
 - **Security**: domain allowlist, localhost and private networks blocked, AST validation of generated code,
   secrets in SecretStorage and masked in reports, tamper-evident audit log.
 

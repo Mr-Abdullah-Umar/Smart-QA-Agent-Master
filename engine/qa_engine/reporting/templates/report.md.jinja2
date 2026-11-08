@@ -31,6 +31,7 @@
 {% for inv in investigations %}
 ### {{ inv.failure_id }}: `{{ inv.tc_id }}`
 * **Category:** {{ inv.category }} (Confidence: {{ "%.0f"|format(inv.confidence * 100) }}%)
+* **Analysis:** {{ {"ai": "AI", "reused": "AI (reused in this run)", "cached": "AI (reused from an earlier run)", "rules": "Deterministic rules"}.get(inv.analysis_source, inv.analysis_source) }}{% if inv.analysis_note %} - {{ inv.analysis_note }}{% endif %}
 {% if inv.requires_human_signoff %}
 * **Gate 2 Sign-off:** {% if inv.gate_2_signed_off %}Signed Off by `{{ inv.signed_off_by }}`{% else %}**REQUIRED (Pending)**{% endif %}
 {% endif %}

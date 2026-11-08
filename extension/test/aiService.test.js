@@ -21,6 +21,7 @@ async function service(provider, extra = {}) {
   settings.set("qaHarness.ai.provider", provider);
   settings.set("qaHarness.ai.model", extra.model ?? "m-1");
   settings.set("qaHarness.ai.baseUrl", extra.baseUrl ?? "");
+  settings.set("qaHarness.ai.investigationModel", extra.investigationModel ?? "");
   const secrets = new MemorySecrets();
   if (extra.key !== null) await secrets.setApiKey(provider, extra.key ?? "sk-test");
   return new AIService(secrets);
@@ -130,6 +131,50 @@ test("refuses non-HTTPS endpoints before sending the key", async () => {
   respond(() => ({ json: {} }));
   await assert.rejects(ai.chat([{ role: "user", content: "hi" }]), /https/);
   assert.equal(calls.length, 0);
+});
+
+test("failure analysis uses the cheaper model; design always uses the main model", async () => {
+  const ai = await service("openai", { model: "big", investigationModel: "small" });
+  respond(() => ({ json: { choices: [{ message: { content: "OK" } }] } }));
+  const design = await ai.chat([{ role: "user", content: "hi" }], 0.2, undefined, "design");
+  const analysis = await ai.chat([{ role: "user", content: "hi" }], 0.2, undefined, "investigation");
+  assert.deepEqual(calls.map((c) => c.body.model), ["big", "small"]);
+  assert.equal(design.model, "openai/big");
+  assert.equal(analysis.model, "openai/small");
+});
+
+test("a failing cheaper model falls back to the main model", async () => {
+  const ai = await service("openai", { model: "big", investigationModel: "missing" });
+  respond((call) =>
+    call.body.model === "missing"
+      ? { status: 404, json: { error: "model not found" } }
+      : { json: { choices: [{ message: { content: "OK" } }] } }
+  );
+  const reply = await ai.chat([{ role: "user", content: "hi" }], 0.2, undefined, "investigation");
+  assert.equal(reply.model, "openai/big");
+  assert.deepEqual(calls.map((c) => c.body.model), ["missing", "big"]);
+});
+
+test("without a cheaper model, analysis uses the main model once", async () => {
+  const ai = await service("openai", { model: "big" });
+  respond(() => ({ json: { choices: [{ message: { content: "OK" } }] } }));
+  await ai.chat([{ role: "user", content: "hi" }], 0.2, undefined, "investigation");
+  assert.deepEqual(calls.map((c) => c.body.model), ["big"]);
+});
+
+test("cost options sent to the engine are bounded and consistent", () => {
+  const { aiCostOptions } = require("../out/engineClient");
+  const cfg = (values) => ({ get: (key, fallback) => (key in values ? values[key] : fallback) });
+  assert.deepEqual(aiCostOptions(cfg({})), {
+    ai_investigation: true,
+    ai_max_investigations: 5,
+    ai_daily_investigation_limit: 50,
+    ai_reuse_analyses: true,
+  });
+  const off = aiCostOptions(cfg({ "ai.maxInvestigationsPerRun": 0, "ai.dailyInvestigationLimit": -3 }));
+  assert.equal(off.ai_investigation, false);
+  assert.equal(off.ai_daily_investigation_limit, 0);
+  assert.equal(aiCostOptions(cfg({ "ai.investigateFailures": false })).ai_investigation, false);
 });
 
 test("status explains what is missing", async () => {

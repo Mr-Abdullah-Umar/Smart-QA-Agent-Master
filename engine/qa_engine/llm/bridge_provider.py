@@ -28,9 +28,18 @@ class ExtensionBridgeProvider(LLMProvider):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
     ) -> LLMResponse:
+        return await self.chat_with_purpose("design", messages, tools, temperature)
+
+    async def chat_with_purpose(
+        self,
+        purpose: str,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[ToolDefinition]] = None,
+        temperature: float = 0.2,
+    ) -> LLMResponse:
         result = await self.channel.request(
             "llm.chat",
-            {"messages": messages, "temperature": temperature},
+            {"messages": messages, "temperature": temperature, "purpose": purpose},
             timeout=self.timeout_seconds,
         )
         result = result or {}

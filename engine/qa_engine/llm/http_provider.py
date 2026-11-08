@@ -8,6 +8,7 @@ Configured only through environment variables, so keys never touch files or argu
     QA_AI_MODEL             model ID (Azure: deployment name; GitHub Models: e.g. openai/gpt-4.1)
     QA_AI_BASE_URL          endpoint (required for azure-openai and openai-compatible)
     QA_AI_AZURE_API_VERSION Azure REST api-version (default 2024-10-21)
+    QA_AI_INVESTIGATION_MODEL optional cheaper model for failure analysis (default QA_AI_MODEL)
 
 Endpoints must be HTTPS and pass the same network policy as test targets.
 """
@@ -53,6 +54,7 @@ class HttpLLMProvider(LLMProvider):
         base_url: Optional[str] = None,
         azure_api_version: str = "2024-10-21",
         timeout_seconds: float = 180.0,
+        investigation_model: Optional[str] = None,
     ):
         if provider not in PROVIDER_IDS:
             raise LLMConfigError(
@@ -75,6 +77,7 @@ class HttpLLMProvider(LLMProvider):
             raise LLMConfigError(f"AI endpoint rejected by network policy: {reason}")
         self.provider = provider
         self.model = model
+        self.investigation_model = (investigation_model or "").strip() or None
         self.base_url = base
         self.azure_api_version = azure_api_version
         self.timeout_seconds = timeout_seconds
@@ -96,6 +99,7 @@ class HttpLLMProvider(LLMProvider):
             model=(env.get("QA_AI_MODEL") or "").strip(),
             base_url=(env.get("QA_AI_BASE_URL") or "").strip() or None,
             azure_api_version=(env.get("QA_AI_AZURE_API_VERSION") or "2024-10-21").strip(),
+            investigation_model=env.get("QA_AI_INVESTIGATION_MODEL"),
         )
 
     async def initialize(self) -> None:
@@ -107,7 +111,23 @@ class HttpLLMProvider(LLMProvider):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
     ) -> LLMResponse:
-        content = await asyncio.to_thread(self._chat_sync, messages, temperature)
+        return await self.chat_with_purpose("design", messages, tools, temperature)
+
+    def model_for(self, purpose: str) -> str:
+        if purpose == "investigation" and self.investigation_model:
+            return self.investigation_model
+        return self.model
+
+    async def chat_with_purpose(
+        self,
+        purpose: str,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[ToolDefinition]] = None,
+        temperature: float = 0.2,
+    ) -> LLMResponse:
+        content = await asyncio.to_thread(
+            self._chat_sync, messages, temperature, self.model_for(purpose)
+        )
         return LLMResponse(content=content, finish_reason="stop")
 
     async def stream_chat(
@@ -122,14 +142,18 @@ class HttpLLMProvider(LLMProvider):
     # ------------------------------------------------------------------ request building
 
     def build_request(
-        self, messages: List[Dict[str, str]], temperature: Optional[float]
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float],
+        model: Optional[str] = None,
     ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
         """URL, headers, and JSON body for one chat call (temperature None = omit)."""
+        model = model or self.model
         headers = {"Content-Type": "application/json"}
         if self.provider == "anthropic":
             system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
             body: Dict[str, Any] = {
-                "model": self.model,
+                "model": model,
                 "max_tokens": 8192,
                 "messages": [
                     {"role": m["role"], "content": m["content"]}
@@ -149,12 +173,12 @@ class HttpLLMProvider(LLMProvider):
             body["temperature"] = temperature
         if self.provider == "azure-openai":
             url = (
-                f"{self.base_url}/openai/deployments/{quote(self.model, safe='')}"
+                f"{self.base_url}/openai/deployments/{quote(model, safe='')}"
                 f"/chat/completions?api-version={quote(self.azure_api_version, safe='')}"
             )
             headers["api-key"] = self._api_key
             return url, headers, body
-        body["model"] = self.model
+        body["model"] = model
         headers["Authorization"] = f"Bearer {self._api_key}"
         return f"{self.base_url}/chat/completions", headers, body
 
@@ -170,15 +194,22 @@ class HttpLLMProvider(LLMProvider):
             raise RuntimeError(f"The {provider} provider returned no message content.")
         return text
 
-    def _chat_sync(self, messages: List[Dict[str, str]], temperature: float) -> str:
+    def _chat_sync(
+        self, messages: List[Dict[str, str]], temperature: float, model: Optional[str] = None
+    ) -> str:
         try:
-            return self._post(messages, temperature)
+            return self._post(messages, temperature, model)
         except _TemperatureRejected:
             # Some reasoning models only accept their default temperature.
-            return self._post(messages, None)
+            return self._post(messages, None, model)
 
-    def _post(self, messages: List[Dict[str, str]], temperature: Optional[float]) -> str:
-        url, headers, body = self.build_request(messages, temperature)
+    def _post(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float],
+        model: Optional[str] = None,
+    ) -> str:
+        url, headers, body = self.build_request(messages, temperature, model)
         request = urllib.request.Request(  # noqa: S310 - https enforced in __init__
             url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
         )

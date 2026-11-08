@@ -119,6 +119,30 @@ def test_chat_retries_without_rejected_temperature(monkeypatch):
     assert len(bodies) == 2 and "temperature" not in bodies[1]
 
 
+def test_investigations_can_use_a_cheaper_model(monkeypatch):
+    models = []
+
+    def fake_urlopen(request, timeout):
+        models.append(json.loads(request.data)["model"])
+        return _Response(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode())
+
+    monkeypatch.setattr(http_provider.urllib.request, "urlopen", fake_urlopen)
+    provider = HttpLLMProvider.from_env(
+        {
+            "QA_AI_PROVIDER": "openai",
+            "QA_AI_API_KEY": "sk",
+            "QA_AI_MODEL": "big-model",
+            "QA_AI_INVESTIGATION_MODEL": "small-model",
+        }
+    )
+    asyncio.run(provider.chat(MESSAGES))
+    asyncio.run(provider.chat_with_purpose("design", MESSAGES))
+    asyncio.run(provider.chat_with_purpose("investigation", MESSAGES))
+    assert models == ["big-model", "big-model", "small-model"]
+    plain = HttpLLMProvider("openai", "sk", "big-model")
+    assert plain.model_for("investigation") == "big-model"
+
+
 def test_http_errors_are_reported_without_the_key(monkeypatch):
     def fake_urlopen(request, timeout):
         raise urllib.error.HTTPError(
