@@ -61,6 +61,7 @@
     .badge-failed { background: #fee2e2; color: #b91c1c; }
     .badge-flaky { background: #fef3c7; color: #b45309; }
     .badge-skipped { background: #f1f5f9; color: #64748b; }
+    .badge-blocked { background: #e2e8f0; color: #334155; }
     .badge-defect { background: #fce7f3; color: #be185d; }
     .metrics-grid {
       display: grid;
@@ -135,6 +136,13 @@
   <div class="container">
     <header>
       <h1>AI QA Testing Harness - Execution Report</h1>
+      {% if module %}
+      <p style="margin: 4px 0; font-size: 18px;">
+        Module: <strong>{{ module }}</strong> &middot; Run type: <strong>{{ run_type|replace('-', ' ')|title }}</strong>
+        {% if environment %}&middot; Environment: <strong>{{ environment }}</strong>{% endif %}
+        {% if triggered_by %}&middot; Triggered by: <strong>{{ triggered_by }}</strong>{% endif %}
+      </p>
+      {% endif %}
       <p style="color: var(--muted); margin: 4px 0;">
         Run ID: <code>{{ run_id }}</code> | Generated: {{ generated_at }} | Target: <strong>{{ target_url }}</strong>
       </p>
@@ -162,6 +170,12 @@
         <div style="color: var(--warning); font-size: 12px;">FLAKY</div>
         <div class="metric-value" style="color: var(--warning);">{{ flaky }}</div>
       </div>
+      {% if blocked %}
+      <div class="metric-card">
+        <div style="color: var(--muted); font-size: 12px;">BLOCKED</div>
+        <div class="metric-value">{{ blocked }}</div>
+      </div>
+      {% endif %}
       <div class="metric-card">
         <div style="color: var(--primary); font-size: 12px;">PASS RATE</div>
         <div class="metric-value" style="color: var(--primary);">{{ "%.1f"|format(pass_rate) }}%</div>
@@ -180,6 +194,7 @@
           <tr>
             <th>ID</th>
             <th>Title</th>
+            <th>AC</th>
             <th>Priority</th>
             <th>Category</th>
             <th>Status</th>
@@ -196,6 +211,7 @@
               <br><small style="color: var(--danger); font-family: monospace;">{{ tc.error_message }}</small>
               {% endif %}
             </td>
+            <td>{{ tc.ac_ref or "-" }}</td>
             <td>{{ tc.priority }}</td>
             <td>{{ tc.category }}</td>
             <td>

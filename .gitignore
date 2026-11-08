@@ -39,6 +39,7 @@ runs/
 
 # Node / VS Code Extension
 node_modules/
+extension/engine/
 out/
 dist/
 *.vsix

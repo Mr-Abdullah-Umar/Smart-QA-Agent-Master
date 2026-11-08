@@ -119,4 +119,3 @@ def test_classify_timeout_automation_issue(tmp_path):
 
     assert report.category == FailureCategory.AUTOMATION_ISSUE
     assert not report.requires_human_signoff
-

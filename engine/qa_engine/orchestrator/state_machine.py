@@ -80,7 +80,7 @@ class OrchestrationStateMachine:
                 },
             )
 
-    async def confirm_scope(self, scope: ScopeModel) -> None:
+    async def confirm_scope(self, scope: ScopeModel, actor: str = "engineer") -> None:
         """Gate 0: Confirm scope, domain allowlist, and legal authorization attestation."""
         if self.state.current_stage != Stage.STAGE_0_SCOPE:
             raise StateTransitionError(f"Cannot confirm scope in stage {self.state.current_stage}")
@@ -95,7 +95,7 @@ class OrchestrationStateMachine:
         self.store.audit.log_event(
             stage=Stage.STAGE_0_SCOPE.value,
             event_type="GATE_0_SCOPE_CONFIRMED",
-            actor="engineer",
+            actor=actor,
             details={
                 "start_url": scope.start_url,
                 "allowed_domains": scope.allowed_domains,
@@ -155,6 +155,21 @@ class OrchestrationStateMachine:
         self.state.current_stage = Stage.STAGE_6_SCRIPT_GEN
         await self._emit_update(f"Gate 1 passed: Test cases v{version} approved by {approver}.")
 
+    async def reopen_review(self, actor: str, reason: str) -> None:
+        """Return from script generation / dry run to the review loop; Gate 1 must be re-passed."""
+        if self.state.current_stage not in (Stage.STAGE_6_SCRIPT_GEN, Stage.STAGE_7_DRY_RUN):
+            raise StateTransitionError(f"Cannot reopen review in stage {self.state.current_stage}")
+        self.state.testcases_approved = False
+        self.state.approved_testcases_hash = None
+        self.store.audit.log_event(
+            stage=self.state.current_stage.value,
+            event_type="GATE_1_APPROVAL_WITHDRAWN",
+            actor=actor,
+            details={"reason": reason[:2000]},
+        )
+        self.state.current_stage = Stage.STAGE_5_REVIEW_LOOP
+        await self._emit_update("Back to review: repaired test cases need approval (Gate 1)")
+
     async def sign_off_gate_2(
         self,
         failure_id: str,
@@ -174,18 +189,69 @@ class OrchestrationStateMachine:
             },
         )
         status_msg = "confirmed" if defect_confirmed else "rejected/dismissed"
+        await self._emit_update(f"Gate 2: Defect {failure_id} {status_msg} by {approver}.")
+
+    async def restore_approved_suite(
+        self,
+        scope: ScopeModel,
+        version: int,
+        sha256_hash: str,
+        original_approver: str,
+        actor: str,
+    ) -> None:
+        """Re-execution of a stored suite whose Gate 1 approval was re-verified on disk.
+
+        Gate 0 is re-attested by `actor` for this run; Gate 1 is inherited from the stored
+        approval only after the caller has re-hashed the cases and scripts.
+        """
+        if not scope.authorized_attestation:
+            raise StateTransitionError("Gate 0 failed: authorization attestation is required.")
+        self.store.save_scope(scope)
+        self.state.scope_confirmed = True
+        self.state.testcases_approved = True
+        self.state.approved_testcases_hash = sha256_hash
+        self.store.write_json_atomic(
+            "approvals.json",
+            {"version": version, "approver": original_approver, "sha256_hash": sha256_hash},
+        )
+        self.store.audit.log_event(
+            stage=Stage.STAGE_0_SCOPE.value,
+            event_type="SUITE_APPROVAL_VERIFIED",
+            actor=actor,
+            details={
+                "start_url": scope.start_url,
+                "allowed_domains": scope.allowed_domains,
+                "version": version,
+                "sha256_hash": sha256_hash,
+                "original_approver": original_approver,
+            },
+        )
+        self.state.current_stage = Stage.STAGE_6_SCRIPT_GEN
         await self._emit_update(
-            f"Gate 2: Defect {failure_id} {status_msg} by {approver}."
+            f"Verified approved suite v{version} (approved by {original_approver})."
         )
 
-    async def cancel(self, reason: str = "User requested cancellation") -> None:
+    async def mark_error(self, reason: str) -> None:
+        """Move the run into the terminal ERROR stage and record why."""
+        self.state.current_stage = Stage.ERROR
+        self.store.audit.log_event(
+            stage=Stage.ERROR.value,
+            event_type="RUN_FAILED",
+            actor="engine",
+            details={"reason": reason},
+        )
+        await self._emit_update(f"Run failed: {reason}")
+
+    async def cancel(
+        self, reason: str = "User requested cancellation", actor: str = "engineer"
+    ) -> None:
         """Cancel current execution and log reason."""
         self.state.is_cancelled = True
         self.state.current_stage = Stage.CANCELLED
         self.store.audit.log_event(
             stage=Stage.CANCELLED.value,
             event_type="RUN_CANCELLED",
-            actor="engineer",
+            actor=actor,
             details={"reason": reason},
         )
         await self._emit_update(f"Run cancelled: {reason}")

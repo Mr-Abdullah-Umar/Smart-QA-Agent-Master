@@ -18,7 +18,7 @@ def test_sandboxed_pytest_runner_execution(tmp_path):
         expected_result="Body is visible",
     )
 
-    scripts = ScriptGenerator.write_scripts(store, [tc], page_name="sample")
+    scripts = ScriptGenerator.write_scripts(store.run_dir / "scripts", [tc], "sample")
 
     runner = PytestRunner(store)
     summary = runner.run_tests(
@@ -26,6 +26,7 @@ def test_sandboxed_pytest_runner_execution(tmp_path):
         base_url="https://example.com",
         retries=0,
         timeout_seconds=60,
+        allowed_domains=["example.com"],
     )
 
     # Verify results

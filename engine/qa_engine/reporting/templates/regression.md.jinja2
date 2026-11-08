@@ -1,0 +1,13 @@
+# Regression Report `{{ regression_id }}`
+
+**Generated:** {{ generated_at }}{% if triggered_by %} | **Triggered by:** {{ triggered_by }}{% endif %}{% if tag %} | **Filter:** {{ tag }}{% endif %}{% if environment %} | **Environment:** {{ environment }}{% endif %}
+
+| Suites | Tests | Passed | Failed | Flaky | Blocked |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| {{ suites|length }} | {{ totals.total }} | {{ totals.passed }} | {{ totals.failed }} | {{ totals.flaky }} | {{ totals.blocked }} |
+
+| Module | Version | Status | Passed / Total | Failed | Newly failing | Fixed |
+| :--- | :---: | :---: | :---: | :---: | :--- | :--- |
+{% for s in suites -%}
+| {{ s.module }} | v{{ s.version }} | **{{ s.status }}** | {{ s.passed }} / {{ s.total }} | {{ s.failed }} | {{ s.newly_failing|join(', ') or '-' }} | {{ s.fixed|join(', ') or '-' }} |
+{% endfor %}

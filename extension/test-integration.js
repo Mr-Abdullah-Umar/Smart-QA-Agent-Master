@@ -1,103 +1,262 @@
 /**
- * End-to-end integration test validating TypeScript RPC Client
- * communicating with the Python QA Engine over child process stdio.
+ * End-to-end integration test: TypeScript RPC client <-> Python engine over stdio.
+ *
+ * Plays the extension's role for engine -> extension requests (`llm.chat` with scripted
+ * replies, `secrets.resolve`) and walks the full workflow: AI suite design with
+ * clarifications, revision, Gate 1 approval, execution, retest, and regression.
+ *
+ * Usage: node test-integration.js <target-url> [--headed]
+ *        (or set QA_TARGET_URL). Artifacts go to a temporary workspace.
  */
 
 const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { RPCClient } = require("./out/rpc/client");
 
-async function runIntegrationTest() {
-  console.log("=== Starting TypeScript <-> Python Engine Integration Test ===");
+const targetUrl = process.argv.find((a) => /^https?:\/\//.test(a)) || process.env.QA_TARGET_URL;
+const headed = process.argv.includes("--headed");
+if (!targetUrl) {
+  console.error("Usage: node test-integration.js <target-url> [--headed]");
+  process.exit(2);
+}
+const host = new URL(targetUrl).hostname;
 
-  const workspaceRoot = path.resolve(__dirname, "..");
-  const engineDir = path.join(workspaceRoot, "engine");
-  const pythonPath = path.join(engineDir, ".venv", "Scripts", "python.exe");
+const MISSING_BUTTON = "QA harness missing element 7f3a";
+
+function testcase(ac, i, titleSuffix, id, broken = false) {
+  return {
+    tc_id: id || null,
+    title: `${ac} check ${titleSuffix}`,
+    ac_ref: ac,
+    priority: i === 0 ? "P1" : "P2",
+    priority_rationale: i === 0 ? "Entry point" : null,
+    test_types: i === 0 ? ["smoke", "sanity"] : ["functional"],
+    steps: ["Open the start page", "Observe the address bar"],
+    expected_result: `The browser stays on ${host}`,
+    actions: [
+      { action: "goto", value: "" },
+      ...(broken ? [{ action: "click", target: { by: "role", role: "button", value: MISSING_BUTTON } }] : []),
+      { action: "expect_url", value: host },
+    ],
+  };
+}
+
+/** Two valid cases; `extra` appends a third case for AC-2, optionally with a broken locator. */
+function designReply(titleSuffix, keepIds = [], extra = null) {
+  const testcases = ["AC-1", "AC-2"].map((ac, i) => testcase(ac, i, titleSuffix, keepIds[i]));
+  if (extra) testcases.push(testcase("AC-2", 1, `${titleSuffix} extra`, keepIds[2], extra.broken));
+  return JSON.stringify({ testcases });
+}
+
+function scriptedLlm(params) {
+  const prompt = (params.messages || []).map((m) => m.content).join("\n");
+  if (prompt.includes("Ask at most 5 clarification questions")) {
+    return JSON.stringify({
+      summary: "Start page must load and stay on the domain.",
+      clarification_questions: [
+        { question_id: "Q-1", question_text: "Which browser matters most?", context: "Scope" },
+      ],
+    });
+  }
+  if (prompt.includes("BEGIN UNTRUSTED LINK LIST")) return JSON.stringify({ urls: [] });
+  if (prompt.includes("BEGIN REVIEWER COMMENTS")) {
+    const current = prompt.match(/Current test cases \(JSON\):\n(.*)\n/);
+    const ids = current ? JSON.parse(current[1]).map((tc) => tc.tc_id) : [];
+    if (prompt.includes("The dry run could not execute")) {
+      return designReply("(repaired)", ids, { broken: false });
+    }
+    if (prompt.includes("were updated")) return designReply("(updated)", ids);
+    return designReply("(revised)", ids, { broken: true });
+  }
+  return designReply("(v1)");
+}
+
+async function main() {
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "qa-ext-e2e-"));
+  const engineDir = path.resolve(__dirname, "..", "engine");
+  const pythonPath = path.join(
+    engineDir,
+    ".venv",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python"
+  );
+  console.log(`Workspace: ${workspaceRoot}\nTarget: ${targetUrl}`);
 
   const child = spawn(pythonPath, ["-u", "-m", "qa_engine.main"], {
     cwd: engineDir,
     env: { ...process.env, PYTHONPATH: engineDir, PYTHONUNBUFFERED: "1" },
-    shell: false,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stderr.on("data", (d) => process.stderr.write(`[engine] ${d}`));
 
-  child.stderr.on("data", (d) => {
-    console.warn(`[Engine stderr]: ${d.toString()}`);
+  const rpc = new RPCClient(child.stdin, child.stdout, 120000);
+  let llmCalls = 0;
+  rpc.onRequest("llm.chat", async (params) => {
+    llmCalls += 1;
+    return { content: scriptedLlm(params), model: "scripted/test" };
   });
+  rpc.onRequest("secrets.resolve", async () => ({ values: {} }));
 
-  const rpc = new RPCClient(child.stdin, child.stdout);
-  let cardReceived = false;
-  let stageUpdateReceived = false;
-
-  rpc.on("notify:card.show", (params) => {
-    console.log(`[Notification Received]: card.show -> type=${params.card_type}`);
-    if (params.card_type === "scope_card") {
-      cardReceived = true;
-    }
+  const waiters = [];
+  rpc.on("notify:card.show", (p) => {
+    console.log(`  card: ${p.card_type}`);
+    const idx = waiters.findIndex((w) => w.type === p.card_type);
+    if (idx >= 0) waiters.splice(idx, 1)[0].resolve(p.data);
   });
-
-  rpc.on("notify:stage.update", (params) => {
-    console.log(`[Notification Received]: stage.update -> stage=${params.stage}`);
-    if (params.stage === "STAGE_1_INTAKE") {
-      stageUpdateReceived = true;
-    }
+  rpc.on("notify:stage.update", (p) => console.log(`  stage: ${p.stage} - ${p.description}`));
+  rpc.on("notify:message.stream", (p) => {
+    if (p.style !== "log" && p.chunk) console.log(`  say: ${p.chunk}`);
+    if (/Run failed/.test(p.chunk || "")) waiters.splice(0).forEach((w) => w.reject(new Error(p.chunk)));
   });
+  const waitCard = (type) =>
+    new Promise((resolve, reject) => {
+      waiters.push({ type, resolve, reject });
+      setTimeout(() => reject(new Error(`Timed out waiting for ${type}`)), 600000).unref();
+    });
+  const call = (method, params) => rpc.sendRequest(method, { workspace_root: workspaceRoot, ...params });
+  const options = { headed, slowmo_ms: headed ? 300 : 0, browser_channel: "chrome", ai_enabled: true };
+  const approver = "integration-tester";
 
   try {
-    // 1. Send run.start
-    console.log("Step 1: Sending run.start...");
-    const startResult = await rpc.sendRequest("run.start", {
-      run_id: "test-run-e2e-phase2",
-      workspace_root: workspaceRoot,
-      start_url: "https://staging.example.com",
-      allowed_domains: ["staging.example.com"],
+    const scope = waitCard("scope_card");
+    await call("run.start", {
+      module: "Integration Module",
+      start_url: targetUrl,
+      environment: "test",
+      requirement_text: "The start page is reachable.",
+      acceptance_criteria: "Start page loads\nUser stays on the domain",
+      design_mode: "ai",
+      ...options,
     });
-    console.log("run.start response:", startResult);
-    if (startResult.status !== "initialized") {
-      throw new Error(`Unexpected start status: ${startResult.status}`);
-    }
+    const scopeData = await scope;
 
-    // Give time for notification event dispatch
-    await new Promise((r) => setTimeout(r, 200));
-    if (!cardReceived) {
-      throw new Error("Failed to receive 'scope_card' notification from engine.");
-    }
-
-    // 2. Send run.scope.confirm (Gate 0)
-    console.log("Step 2: Sending run.scope.confirm (Gate 0)...");
-    const scopeResult = await rpc.sendRequest("run.scope.confirm", {
-      scope: {
-        start_url: "https://staging.example.com",
-        allowed_domains: ["staging.example.com"],
-        environment: "test",
-        authorized_attestation: true,
-      },
+    const clarify = waitCard("clarification_card");
+    await call("run.scope.confirm", {
+      approver,
+      scope: { ...scopeData, environment: "test", authorized_attestation: true },
     });
-    console.log("run.scope.confirm response:", scopeResult);
-    if (scopeResult.stage !== "STAGE_1_INTAKE") {
-      throw new Error(`Unexpected stage after Gate 0: ${scopeResult.stage}`);
-    }
-
-    await new Promise((r) => setTimeout(r, 200));
-    if (!stageUpdateReceived) {
-      throw new Error("Failed to receive 'stage.update' notification for STAGE_1_INTAKE.");
-    }
-
-    // 3. Send run.cancel
-    console.log("Step 3: Sending run.cancel...");
-    const cancelResult = await rpc.sendRequest("run.cancel", {
-      reason: "Integration test completed successfully",
+    const questions = await clarify;
+    const review1 = waitCard("review_card");
+    await call("run.clarifications.answer", {
+      approver,
+      answers: { [questions.questions[0].question_id]: "Chrome" },
     });
-    console.log("run.cancel response:", cancelResult);
+    const v1 = await review1;
 
-    console.log("=== Integration Test PASSED 100%! ===");
+    // v2 adds a case whose click target does not exist: the dry run must catch it.
+    const review2 = waitCard("review_card");
+    await call("run.testcases.revise", { approver, comments: "Add one more AC-2 case." });
+    const v2 = await review2;
+    if (v2.version !== 2 || !v2.diff_summary) throw new Error("Revision did not produce v2");
+    const dryRun = waitCard("dry_run_card");
+    await call("run.testcases.approve", { approver, version: v2.version, sha256_hash: v2.sha256_hash });
+    const dryRunData = await dryRun;
+
+    const review3 = waitCard("review_card");
+    await call("run.dryrun.decide", { approver, decision: "fix" });
+    const v3 = await review3;
+    const report = waitCard("report_card");
+    await call("run.testcases.approve", { approver, version: v3.version, sha256_hash: v3.sha256_hash });
+    const initial = await report;
+    console.log(`Initial run: ${initial.passed}/${initial.total} passed`);
+
+    const list = await call("suites.list", {});
+    const slug = list.suites[0].slug;
+    const stored = await call("suite.get", { slug });
+
+    // Update: same module, edited requirement -> AI revises the approved suite (keeps IDs).
+    const updScope = waitCard("scope_card");
+    await call("run.start", {
+      module: "Integration Module",
+      start_url: targetUrl,
+      environment: "test",
+      requirement_text: "The start page is reachable (edited).",
+      acceptance_criteria: "Start page loads\nUser stays on the domain",
+      design_mode: "ai",
+      ...options,
+    });
+    const updScopeData = await updScope;
+    const updClarify = waitCard("clarification_card");
+    await call("run.scope.confirm", {
+      approver,
+      scope: { ...updScopeData, environment: "test", authorized_attestation: true },
+    });
+    const updQuestions = await updClarify;
+    const updReview = waitCard("review_card");
+    await call("run.clarifications.answer", {
+      approver,
+      answers: { [updQuestions.questions[0].question_id]: "Chrome" },
+    });
+    const updated = await updReview;
+    const updReport = waitCard("report_card");
+    await call("run.testcases.approve", { approver, version: updated.version, sha256_hash: updated.sha256_hash });
+    const updRun = await updReport;
+
+    const retest = waitCard("report_card");
+    await call("suite.retest", {
+      slug,
+      approver,
+      authorized_attestation: true,
+      environment: "staging",
+      base_url: targetUrl,
+      ...options,
+    });
+    const retestData = await retest;
+    const afterRetest = (await call("suites.list", {})).suites[0];
+
+    const regression = waitCard("regression_card");
+    await call("regression.run", {
+      approver,
+      authorized_attestation: true,
+      tag: "smoke",
+      environment: "staging",
+      ...options,
+    });
+    const reg = await regression;
+
+    const deleted = await call("suite.delete", { slug, approver });
+    const afterDelete = await call("suites.list", {});
+
+    const checks = {
+      "design produced 2 cases": v1.testcases.length === 2,
+      "revision kept case IDs":
+        JSON.stringify(v2.testcases.slice(0, 2).map((t) => t.tc_id)) ===
+        JSON.stringify(v1.testcases.map((t) => t.tc_id)),
+      "dry run flagged only the missing element":
+        dryRunData.issues.length === 1 &&
+        dryRunData.issues[0].kind === "not_found" &&
+        dryRunData.issues[0].tc_id === v2.testcases[2].tc_id,
+      "dry-run fix went back to review as v3": v3.version === 3 && v3.testcases.length === 3,
+      "initial run executed the 3 repaired cases": initial.total === 3 && initial.failed === 0,
+      "suite.get returns the stored requirement": stored.requirement_text === "The start page is reachable.",
+      "update kept IDs and dropped the extra case":
+        updated.testcases.length === 2 &&
+        updated.testcases.every((t, i) => t.tc_id === v1.testcases[i].tc_id) &&
+        /Changes against approved suite/.test(updated.diff_summary || ""),
+      "updated suite ran as an update": updRun.total === 2 && updRun.run_type === "update",
+      "retest ran on the staging environment":
+        retestData.run_type === "retest" && retestData.environment === "staging",
+      "staging environment was saved": afterRetest.environments.staging === targetUrl,
+      "smoke regression on staging ran only the 1 smoke case":
+        reg.totals.total === 1 && reg.environment === "staging",
+      "delete archived the suite": deleted.status === "archived" && afterDelete.suites.length === 0,
+      "AI used for analysis, design, revision and repair": llmCalls >= 5,
+    };
+    for (const [name, passed] of Object.entries(checks)) {
+      console.log(`  [${passed ? "ok" : "FAIL"}] ${name}`);
+    }
+    const ok = Object.values(checks).every(Boolean);
+    console.log(`\nLLM calls: ${llmCalls}; regression report: ${reg.report_html}`);
+    console.log(ok ? "=== INTEGRATION TEST PASSED ===" : "=== INTEGRATION TEST FAILED ===");
+    process.exitCode = ok ? 0 : 1;
+  } catch (e) {
+    console.error("=== INTEGRATION TEST FAILED ===", e);
+    process.exitCode = 1;
   } finally {
-    child.kill("SIGTERM");
+    child.stdin.end();
+    child.kill();
   }
 }
 
-runIntegrationTest().catch((err) => {
-  console.error("Integration test failed:", err);
-  process.exit(1);
-});
-
+main();

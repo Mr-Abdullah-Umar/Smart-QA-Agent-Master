@@ -11,6 +11,8 @@ Implements Section 8.12 specifications:
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+from xml.sax.saxutils import escape as xml_escape
+from xml.sax.saxutils import quoteattr
 
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field
@@ -27,6 +29,7 @@ class RenderedTestOutcome(BaseModel):
     title: str = ""
     priority: str = "P1"
     category: str = "functional"
+    ac_ref: str = ""
     status: str
     duration_seconds: float = 0.0
     error_message: Optional[str] = None
@@ -36,11 +39,16 @@ class ReportPayload(BaseModel):
     run_id: str
     generated_at: str
     target_url: str
+    module: str = ""
+    run_type: str = "initial"
+    environment: str = ""
+    triggered_by: str = ""
     gate_1_hash: Optional[str] = None
     total_tests: int = 0
     passed: int = 0
     failed: int = 0
     flaky: int = 0
+    blocked: int = 0
     skipped: int = 0
     pass_rate: float = 0.0
     duration_seconds: float = 0.0
@@ -74,6 +82,10 @@ class ReportBuilder:
         gate_1_hash: Optional[str] = None,
         audit_count: int = 0,
         audit_hash_head: str = "",
+        module: str = "",
+        run_type: str = "initial",
+        environment: str = "",
+        triggered_by: str = "",
     ) -> ReportPayload:
         """Collate and normalize execution data into structured report payload."""
         # Map TC-ID to title and metadata
@@ -89,8 +101,9 @@ class ReportBuilder:
                 RenderedTestOutcome(
                     tc_id=outcome.tc_id,
                     title=tc_meta.title if tc_meta else f"Test {outcome.tc_id}",
-                    priority=tc_meta.priority if tc_meta else "P1",
-                    category=tc_meta.category if tc_meta else "functional",
+                    priority=tc_meta.priority.value if tc_meta else "P1",
+                    category=tc_meta.category.value if tc_meta else "functional",
+                    ac_ref=(tc_meta.ac_ref or "") if tc_meta else "",
                     status=outcome.status.upper(),
                     duration_seconds=outcome.duration_seconds,
                     error_message=outcome.error_message,
@@ -98,20 +111,23 @@ class ReportBuilder:
             )
 
         pass_rate = (
-            (summary.passed / summary.total_tests * 100.0)
-            if summary.total_tests > 0
-            else 0.0
+            (summary.passed / summary.total_tests * 100.0) if summary.total_tests > 0 else 0.0
         )
 
         return ReportPayload(
             run_id=run_id,
             generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             target_url=target_url,
+            module=module,
+            run_type=run_type,
+            environment=environment,
+            triggered_by=triggered_by,
             gate_1_hash=gate_1_hash,
             total_tests=summary.total_tests,
             passed=summary.passed,
             failed=summary.failed,
             flaky=summary.flaky,
+            blocked=summary.blocked,
             skipped=summary.skipped,
             pass_rate=pass_rate,
             duration_seconds=summary.duration_seconds,
@@ -148,20 +164,24 @@ class ReportBuilder:
             '<?xml version="1.0" encoding="utf-8"?>',
             f'<testsuites time="{payload.duration_seconds:.2f}">',
             f'  <testsuite name="QA_Harness_Suite" tests="{payload.total_tests}" '
-            f'failures="{payload.failed}" errors="0" skipped="{payload.skipped}" '
+            f'failures="{payload.failed}" errors="0" '
+            f'skipped="{payload.skipped + payload.blocked}" '
             f'time="{payload.duration_seconds:.2f}">',
         ]
 
         for tc in payload.test_outcomes:
             lines.append(
-                f'    <testcase classname="test_suite" name="{tc.tc_id}" '
-                f'time="{tc.duration_seconds:.2f}">'
+                f"    <testcase classname={quoteattr(payload.module or 'test_suite')} "
+                f'name={quoteattr(tc.tc_id)} time="{tc.duration_seconds:.2f}">'
             )
             if tc.status == "FAILED":
-                err_msg = (tc.error_message or "Test failed").replace('"', '&quot;')
-                lines.append(f'      <failure message="{err_msg}">{err_msg}</failure>')
-            elif tc.status == "SKIPPED":
-                lines.append('      <skipped message="Test skipped"/>')
+                err_msg = tc.error_message or "Test failed"
+                lines.append(
+                    f"      <failure message={quoteattr(err_msg)}>{xml_escape(err_msg)}</failure>"
+                )
+            elif tc.status in ("SKIPPED", "BLOCKED"):
+                reason = tc.error_message or f"Test {tc.status.lower()}"
+                lines.append(f"      <skipped message={quoteattr(reason)}/>")
             lines.append("    </testcase>")
 
         lines.append("  </testsuite>")

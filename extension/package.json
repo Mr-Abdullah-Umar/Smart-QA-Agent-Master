@@ -1,17 +1,25 @@
 {
   "name": "ai-qa-testing-harness",
   "displayName": "AI QA Testing Harness",
-  "description": "Advanced AI QA Testing Harness for Visual Studio Code",
-  "version": "0.1.0",
+  "description": "Requirement-driven test suites, retesting, and regression with Playwright, GitHub Copilot, or your own AI provider",
+  "version": "0.3.0",
   "publisher": "qa-engineering",
+  "license": "UNLICENSED",
   "engines": {
-    "vscode": "^1.88.0"
+    "vscode": "^1.94.0"
   },
   "categories": [
     "Testing",
+    "AI",
     "Other"
   ],
   "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The QA Harness runs browsers and Python test scripts."
+    }
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -32,50 +40,93 @@
       ]
     },
     "commands": [
-      {
-        "command": "qaHarness.startRun",
-        "title": "Start New Run",
-        "category": "QA Harness"
-      },
-      {
-        "command": "qaHarness.cancelRun",
-        "title": "Cancel Current Run",
-        "category": "QA Harness"
-      },
-      {
-        "command": "qaHarness.setCredentials",
-        "title": "Store Test Credentials",
-        "category": "QA Harness"
-      }
+      { "command": "qaHarness.newSuite", "title": "New Suite (Requirement + Acceptance Criteria)", "category": "QA Harness" },
+      { "command": "qaHarness.startRun", "title": "Start New Run", "category": "QA Harness" },
+      { "command": "qaHarness.retestModule", "title": "Retest Module", "category": "QA Harness" },
+      { "command": "qaHarness.updateSuite", "title": "Update Suite (Edit Requirement)", "category": "QA Harness" },
+      { "command": "qaHarness.deleteSuite", "title": "Delete Suite", "category": "QA Harness" },
+      { "command": "qaHarness.runRegression", "title": "Run Regression (All Suites)", "category": "QA Harness" },
+      { "command": "qaHarness.configureAi", "title": "Connect AI Provider (Copilot / API key)", "category": "QA Harness" },
+      { "command": "qaHarness.setupEngine", "title": "Set Up Engine", "category": "QA Harness" },
+      { "command": "qaHarness.signIn", "title": "Sign In / Switch GitHub Account (Approver)", "category": "QA Harness" },
+      { "command": "qaHarness.signOut", "title": "Sign Out GitHub Account (Approver)", "category": "QA Harness" },
+      { "command": "qaHarness.setCredentials", "title": "Manage Suite Secrets", "category": "QA Harness" },
+      { "command": "qaHarness.cancelRun", "title": "Cancel Current Run", "category": "QA Harness" }
     ],
     "configuration": {
       "title": "AI QA Testing Harness",
       "properties": {
+        "qaHarness.ai.provider": {
+          "type": "string",
+          "enum": ["copilot", "openai", "azure-openai", "anthropic", "gemini", "github-models", "openai-compatible", "none"],
+          "enumDescriptions": [
+            "GitHub Copilot through the VS Code Language Model API (no key)",
+            "OpenAI API key",
+            "Azure OpenAI resource endpoint + key (model = deployment name)",
+            "Anthropic Claude API key",
+            "Google Gemini API key",
+            "GitHub Models with a fine-grained token (Models: read)",
+            "Any OpenAI-compatible HTTPS endpoint + key",
+            "No AI: smoke suites from page structure only"
+          ],
+          "default": "copilot",
+          "description": "AI provider used for requirement analysis, test design, and failure investigation."
+        },
+        "qaHarness.ai.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model ID (or Azure deployment name). Empty uses the first available Copilot model."
+        },
+        "qaHarness.ai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "HTTPS endpoint for Azure OpenAI or OpenAI-compatible providers. Empty uses the provider default."
+        },
+        "qaHarness.ai.azureApiVersion": {
+          "type": "string",
+          "default": "2024-10-21",
+          "description": "Azure OpenAI REST api-version."
+        },
+        "qaHarness.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Folder containing the qa_engine package. Empty uses the workspace 'engine' folder or the copy bundled with the extension."
+        },
         "qaHarness.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Path to Python interpreter for the QA Engine (defaults to engine/.venv)."
+          "description": "Python interpreter for the engine. Empty uses engine/.venv or the private environment created by 'Set Up Engine'."
         },
-        "qaHarness.requireScriptApproval": {
+        "qaHarness.headed": {
           "type": "boolean",
-          "default": false,
-          "description": "Require explicit human approval on script preview card before execution."
+          "default": true,
+          "description": "Show the browser window (headed mode) during exploration and test execution."
+        },
+        "qaHarness.slowMoMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "description": "Delay in milliseconds between browser actions in headed mode, so each step is visible."
+        },
+        "qaHarness.browserChannel": {
+          "type": "string",
+          "enum": ["chrome", "msedge", ""],
+          "default": "chrome",
+          "description": "Browser to drive: installed Google Chrome, Microsoft Edge, or empty for Playwright's bundled Chromium. Falls back to Chromium when Chrome is not installed."
         }
       }
     }
   },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/example/ai-qa-testing-harness"
-  },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --allow-missing-repository"
+    "bundle-engine": "node scripts/bundle-engine.js",
+    "test": "npm run compile && node --test \"test/*.test.js\"",
+    "package": "npm run compile && npm run bundle-engine && vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
-    "@types/vscode": "^1.88.0",
+    "@types/vscode": "^1.94.0",
     "@vscode/vsce": "^4.1.0",
     "typescript": "^5.4.5"
   }

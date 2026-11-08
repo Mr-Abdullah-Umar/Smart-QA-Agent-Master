@@ -60,4 +60,3 @@ def test_accessibility_violation_model():
     )
     assert violation.rule_id == "image-alt"
     assert violation.impact == "critical"
-

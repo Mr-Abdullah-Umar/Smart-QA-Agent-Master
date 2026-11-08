@@ -6,14 +6,18 @@ Enforces Section 8.7 specifications:
 - Web-first assertions with automatic waiting; fixed sleeps banned.
 - Secrets and base URLs come from harness fixtures, never literals.
 - Modular Page Objects created in scripts/pages/ using semantic role locators.
+
+Code is compiled deterministically from each case's validated action plan; nothing the
+model writes is executed verbatim.
 """
 
+import json
 import re
 from pathlib import Path
 from typing import Dict, List
 
+from qa_engine.generation.actions import describe_action, locator_expr, render_action
 from qa_engine.generation.testcases import TestCase
-from qa_engine.orchestrator.run_store import RunStore
 
 
 def sanitize_identifier(text: str) -> str:
@@ -24,114 +28,151 @@ def sanitize_identifier(text: str) -> str:
     return clean.lower()
 
 
+def test_function_name(tc_id: str) -> str:
+    return f"test_{sanitize_identifier(tc_id)}"
+
+
+def _py_str(value: str) -> str:
+    """Render a string as a safely escaped Python literal (JSON strings are valid Python)."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _single_line(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _comment(text: str) -> str:
+    return _single_line(text).replace("\\", "/")
+
+
+def _role_locator(test_data: Dict[str, str]) -> str:
+    role = _py_str(test_data.get("role", "button"))
+    name = test_data.get("name", "")
+    if name:
+        expr = f"page.get_by_role({role}, name={_py_str(name)}, exact=True)"
+    else:
+        expr = f"page.get_by_role({role})"
+    return f"{expr}.first"
+
+
 class ScriptGenerator:
     """Generates Python Playwright/pytest test suites and Page Object classes."""
 
     @classmethod
-    def generate_page_object(cls, class_name: str, elements: Dict[str, Dict[str, str]]) -> str:
-        """Generate a Page Object Model class using role-based locators."""
+    def generate_page_object(cls, class_name: str, testcases: List[TestCase]) -> str:
+        """Page Object exposing every distinct locator used by the suite's action plans."""
         lines = [
             '"""Auto-generated Page Object using semantic Playwright locators."""',
-            "from playwright.sync_api import Page, Locator, expect",
+            "from playwright.sync_api import Locator, Page",
+            "",
             "",
             f"class {class_name}:",
             "    def __init__(self, page: Page):",
             "        self.page = page",
         ]
-
-        # Define locator properties
-        for key, info in elements.items():
-            attr_name = sanitize_identifier(key)
-            role = info.get("role", "button")
-            name = info.get("name", "")
-            if name:
-                lines.append(
-                    f'        self.{attr_name}: Locator = page.get_by_role("{role}", name="{name}")'
-                )
-            else:
-                lines.append(f'        self.{attr_name}: Locator = page.get_by_role("{role}")')
-
+        seen: Dict[str, str] = {}
+        for tc in testcases:
+            for action in tc.actions:
+                if not action.target:
+                    continue
+                expr = locator_expr(action.target)
+                if expr in seen.values():
+                    continue
+                base = sanitize_identifier(
+                    f"{action.target.role or action.target.by}_{action.target.value}"
+                )[:48]
+                attr, n = base, 2
+                while attr in seen:
+                    attr, n = f"{base}_{n}", n + 1
+                seen[attr] = expr
+        for attr, expr in seen.items():
+            lines.append(f"        self.{attr}: Locator = {expr}")
         lines.append("")
         return "\n".join(lines)
 
     @classmethod
-    def generate_test_suite(
-        cls,
-        suite_name: str,
-        testcases: List[TestCase],
-        page_imports: List[str],
-    ) -> str:
+    def generate_test_suite(cls, suite_name: str, testcases: List[TestCase]) -> str:
         """Generate pytest test functions mapped 1-to-1 with approved test cases."""
         lines = [
-            f'"""Auto-generated pytest suite: {suite_name}."""',
+            f'"""Auto-generated pytest suite: {_comment(suite_name)}."""',
+            "import re",
+            "",
             "import pytest",
             "from playwright.sync_api import Page, expect",
+            "",
         ]
 
-        for p_import in page_imports:
-            lines.append(f"from pages.{p_import} import {p_import.capitalize()}Page")
-
-        lines.append("")
-
         for tc in testcases:
-            func_name = f"test_{sanitize_identifier(tc.tc_id)}"
-            lines.append(f'@pytest.mark.tc("{tc.tc_id}")')
-            lines.append(f"def {func_name}(page: Page, base_url: str):")
-            lines.append(f'    """{tc.title}')
-            lines.append(f"    Requirement: {tc.requirement_ref}")
+            docstring = _single_line(tc.title).replace("\\", "/").replace('"', "'")
+            lines.append("")
+            lines.append(f"@pytest.mark.tc({_py_str(tc.tc_id)})")
+            for test_type in tc.test_types:
+                lines.append(f"@pytest.mark.{test_type}")
+            lines.append(
+                f"def {test_function_name(tc.tc_id)}(page: Page, harness_url, harness_text):"
+            )
+            lines.append(f'    """{docstring}')
+            lines.append(f"    Requirement: {_comment(tc.requirement_ref)}")
+            if tc.ac_ref:
+                lines.append(f"    Acceptance criterion: {_comment(tc.ac_ref)}")
             lines.append(f"    Priority: {tc.priority.value}")
             lines.append('    """')
 
-            # Preconditions as comments
             if tc.preconditions:
                 lines.append("    # Preconditions:")
                 for pre in tc.preconditions:
-                    lines.append(f"    # - {pre}")
-
-            # Steps as numbered comments with placeholder actions
+                    lines.append(f"    # - {_comment(pre)}")
             lines.append("    # Test Steps:")
             for idx, step in enumerate(tc.steps, start=1):
-                lines.append(f"    # Step {idx}: {step}")
-                if "navigate" in step.lower() or "open" in step.lower():
-                    lines.append("    page.goto(base_url)")
+                lines.append(f"    # Step {idx}: {_comment(step)}")
+            lines.append(f"    # Expected: {_comment(tc.expected_result)}")
 
-            # Expected result assertion
-            lines.append("    # Expected Result Verification:")
-            lines.append(f"    # Verify: {tc.expected_result}")
-            lines.append('    expect(page.locator("body")).to_be_visible()')
-            lines.append("")
+            if not tc.actions or tc.actions[0].action != "goto":
+                lines.append('    page.goto(harness_url(""))')
+            if tc.actions:
+                for action in tc.actions:
+                    lines.append(f"    # {_comment(describe_action(action))}")
+                    lines.append(f"    {render_action(action)}")
+            else:
+                lines.extend(cls._legacy_assertion_lines(tc))
 
+        lines.append("")
         return "\n".join(lines)
 
     @classmethod
-    def write_scripts(
-        cls,
-        run_store: RunStore,
-        testcases: List[TestCase],
-        page_name: str = "main",
-    ) -> Dict[str, Path]:
-        """Write generated Page Objects and pytest suites into the run store."""
-        pages_dir = run_store.run_dir / "scripts" / "pages"
-        tests_dir = run_store.run_dir / "scripts" / "tests"
+    def _legacy_assertion_lines(cls, tc: TestCase) -> List[str]:
+        """Assertions for cases drafted before action plans existed (test_data['check'])."""
+        data = tc.test_data or {}
+        check = data.get("check")
+        if check == "title":
+            return [f"    expect(page).to_have_title({_py_str(data.get('expected', ''))})"]
+        if check == "visible":
+            return [f"    expect({_role_locator(data)}).to_be_visible()"]
+        if check == "fillable":
+            value = _py_str(data.get("value", "qa-harness-sample"))
+            return [
+                f"    {_role_locator(data)}.fill({value})",
+                f"    expect({_role_locator(data)}).to_have_value({value})",
+            ]
+        return ['    expect(page.locator("body")).to_be_visible()']
 
+    @classmethod
+    def write_scripts(
+        cls, scripts_dir: Path, testcases: List[TestCase], module_name: str
+    ) -> Dict[str, Path]:
+        """Write the Page Object and pytest suite for one module into `scripts_dir`."""
+        slug = sanitize_identifier(module_name)
+        pages_dir = scripts_dir / "pages"
+        tests_dir = scripts_dir / "tests"
         pages_dir.mkdir(parents=True, exist_ok=True)
         tests_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create __init__.py files
         (pages_dir / "__init__.py").touch()
         (tests_dir / "__init__.py").touch()
 
-        # 1. Generate Page Object
-        page_code = cls.generate_page_object(f"{page_name.capitalize()}Page", {})
-        page_path = pages_dir / f"{page_name}.py"
-        page_path.write_text(page_code, encoding="utf-8")
+        class_name = "".join(part.capitalize() for part in slug.split("_")) + "Page"
+        page_path = pages_dir / f"{slug}_page.py"
+        page_path.write_text(cls.generate_page_object(class_name, testcases), encoding="utf-8")
 
-        # 2. Generate Test Suite
-        test_code = cls.generate_test_suite("Functional Suite", testcases, [page_name])
-        test_path = tests_dir / "test_functional.py"
-        test_path.write_text(test_code, encoding="utf-8")
-
-        return {
-            "page": page_path,
-            "test": test_path,
-        }
+        test_path = tests_dir / f"test_{slug}.py"
+        test_path.write_text(cls.generate_test_suite(module_name, testcases), encoding="utf-8")
+        return {"page": page_path, "test": test_path}

@@ -1,18 +1,32 @@
 # AI QA Testing Harness for Visual Studio Code
 
-An enterprise-grade, deterministic AI QA Testing Harness implemented in Visual Studio Code and Python.
+Turn a requirement and its acceptance criteria into an approved Playwright test suite, run it in a real
+browser, and keep it for retesting and regression.
 
-## Key Features
-- **11-Stage Deterministic Workflow**: From scope confirmation and requirement analysis to automated POM test generation, sandboxed execution, and multi-format reporting.
-- **Three Human Approval Gates**:
-  - **Gate 0 (Scope Attestation)**: Enforces domain allowlists, environment checks, and explicit engineer authorization.
-  - **Gate 1 (Test Design Sign-off)**: Cryptographically binds approved test cases to a SHA-256 hash before test scripts can be generated.
-  - **Gate 2 (Defect Sign-off)**: Mandates human engineer review and sign-off before any failed test is logged as a product defect.
-- **Strict Zero-Trust Security**:
-  - SSRF route interception and DNS rebinding protections.
-  - AST security validation banning `eval`, `exec`, `subprocess`, `os`, and unwhitelisted libraries.
-  - CSP 128-bit cryptographic nonces in Webview.
-  - PII and high-entropy secret redaction before any LLM submission.
-  - Tamper-evident SHA-256 hash-chained audit logging (`audit.jsonl`).
-- **Multi-Format Reports**: Self-contained zero-JS HTML reports, Markdown summaries, JUnit XML, and canonical JSON.
+## Features
 
+- **Test suites per module**: the AI analyzes the requirement, asks clarifying questions, explores the
+  target pages, and drafts test cases mapped to each acceptance criterion with an automation plan.
+- **Review and approve (Gate 1)**: request revisions or approve. The approval is bound to a SHA-256 hash and
+  your GitHub account name.
+- **Dry run**: before execution every step is tried once on the live page. Steps that cannot be performed
+  are listed with screenshots; let the AI repair them (and re-approve), run anyway, or cancel.
+- **Update and delete suites**: edit the requirement or criteria and the AI revises the approved suite,
+  keeping the IDs of unchanged cases; deleted suites are archived, not erased.
+- **Retesting**: re-run all cases of a module or only the failed ones, on its default environment or any other
+  (e.g. staging, uat), with integrity checks on the stored suite.
+- **Regression**: run every suite, optionally filtered by test type (smoke, sanity, regression, functional,
+  negative, boundary, ui, accessibility) and environment, with a combined report of newly failing and fixed cases.
+- **AI providers**: GitHub Copilot through VS Code with no key, or OpenAI, Azure OpenAI, Anthropic, Gemini,
+  GitHub Models, or any OpenAI-compatible HTTPS endpoint with an API key, all from the **AI Provider** tab.
+- **Security**: domain allowlist, localhost and private networks blocked, AST validation of generated code,
+  secrets in SecretStorage and masked in reports, tamper-evident audit log.
+
+## Getting started
+
+1. Open a trusted folder and click the **QA Harness** beaker in the Activity Bar.
+2. Click **Set Up Engine** once (requires Python 3.10+ on the PATH).
+3. Check the **AI Provider** tab (Copilot is the default) and sign in with GitHub.
+4. In the **Suites** tab, click **New Suite** and enter the module, start URL, requirement, and acceptance criteria.
+
+Full documentation: `docs/user-guide.md` in the project repository.

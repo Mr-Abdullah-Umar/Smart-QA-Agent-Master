@@ -20,6 +20,7 @@ from qa_engine.investigation.schemas import (
     InvestigationReport,
 )
 from qa_engine.llm.provider import LLMProvider
+from qa_engine.llm.structured import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +53,46 @@ class FailureClassifier:
         self.llm = llm
         self.reports: Dict[str, InvestigationReport] = {}
 
+    def _next_failure_id(self) -> str:
+        return f"FAIL-{len(self.reports) + 1:03d}"
+
     def investigate(
         self,
         outcome: TestCaseOutcome,
         requirement_ref: Optional[str] = None,
     ) -> InvestigationReport:
-        """Perform root cause analysis on a failed or flaky test case outcome."""
-        next_id = len(self.reports) + 1
-        failure_id = f"FAIL-{next_id:03d}"
+        """Rule-based root cause analysis (no LLM) for a failed or flaky outcome."""
+        failure_id = self._next_failure_id()
+        return self._rule_based(failure_id, outcome) or self._build_heuristic_fallback(
+            failure_id, outcome
+        )
 
-        # 1. Rule-based deterministic shortcuts
+    async def investigate_async(
+        self,
+        outcome: TestCaseOutcome,
+        requirement_ref: Optional[str] = None,
+    ) -> InvestigationReport:
+        """Root cause analysis using deterministic rules first, then the LLM if connected."""
+        failure_id = self._next_failure_id()
+        report = self._rule_based(failure_id, outcome)
+        if report:
+            return report
+        if self.llm:
+            try:
+                report = await self._run_llm_investigation(failure_id, outcome, requirement_ref)
+                if report:
+                    self._verify_and_sanitize_report(report)
+                    self.reports[failure_id] = report
+                    return report
+            except Exception as exc:
+                logger.warning(
+                    "LLM investigation failed for %s, using fallback: %s", outcome.tc_id, exc
+                )
+        return self._build_heuristic_fallback(failure_id, outcome)
+
+    def _rule_based(
+        self, failure_id: str, outcome: TestCaseOutcome
+    ) -> Optional[InvestigationReport]:
         if outcome.status == "flaky":
             return self._build_flaky_report(failure_id, outcome)
 
@@ -85,28 +116,9 @@ class FailureClassifier:
                 category=FailureCategory.ENVIRONMENT_FAILURE,
                 reason="Backend server or network infrastructure returned 5xx / connection error.",
             )
+        return None
 
-        # 2. If LLM provider is available, attempt structured LLM investigation
-        if self.llm:
-            try:
-                report = self._run_llm_investigation(failure_id, outcome, requirement_ref)
-                if report:
-                    self._verify_and_sanitize_report(report)
-                    self.reports[failure_id] = report
-                    return report
-            except Exception as exc:
-                logger.warning(
-                    "LLM investigation failed for %s, using fallback: %s",
-                    outcome.tc_id,
-                    exc,
-                )
-
-        # 3. Fallback deterministic classification
-        return self._build_heuristic_fallback(failure_id, outcome)
-
-    def _build_flaky_report(
-        self, failure_id: str, outcome: TestCaseOutcome
-    ) -> InvestigationReport:
+    def _build_flaky_report(self, failure_id: str, outcome: TestCaseOutcome) -> InvestigationReport:
         """Build report for retried passing test marked flaky."""
         facts = []
         citations = []
@@ -249,7 +261,7 @@ class FailureClassifier:
         self.reports[failure_id] = report
         return report
 
-    def _run_llm_investigation(
+    async def _run_llm_investigation(
         self,
         failure_id: str,
         outcome: TestCaseOutcome,
@@ -267,10 +279,10 @@ class FailureClassifier:
         evidence_prompt = "\n".join(ev_lines) if ev_lines else "None recorded."
 
         user_prompt = f"""Investigate test failure for {outcome.tc_id}.
-Requirement Ref: {requirement_ref or 'N/A'}
-Error Message: {outcome.error_message or 'N/A'}
+Requirement Ref: {requirement_ref or "N/A"}
+Error Message: {outcome.error_message or "N/A"}
 Stack Trace:
-{outcome.stack_trace or 'N/A'}
+{outcome.stack_trace or "N/A"}
 
 Available Evidence IDs:
 {evidence_prompt}
@@ -282,13 +294,8 @@ Analyze the root cause and return JSON matching the schema."""
             {"role": "user", "content": user_prompt},
         ]
 
-        response = self.llm.chat(messages, temperature=0.1)
-        content = response.content.strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(lines[1:-1]).strip()
-
-        data = json.loads(content)
+        response = await self.llm.chat(messages, temperature=0.1)
+        data = json.loads(extract_json_object(response.content or ""))
         data["failure_id"] = failure_id
         data["tc_id"] = outcome.tc_id
         return InvestigationReport.model_validate(data)

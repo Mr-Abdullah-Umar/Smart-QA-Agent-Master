@@ -1,53 +1,168 @@
-"""Unit tests for DryRunStabilizer invariant: assertions are never auto-repaired."""
+"""Stage 7 dry run: locator presence, interactions, secrets, and repair instructions.
 
-from qa_engine.execution.dry_run import DryRunStabilizer
-from qa_engine.execution.runner import ExecutionSummary, PytestRunner, TestCaseOutcome
-from qa_engine.orchestrator.run_store import RunStore
+Runs against static HTML in a real headless Chromium; navigation is injected so no network
+access (and no SSRF exception for local content) is needed.
+"""
+
+import asyncio
+
+from playwright.async_api import async_playwright
+
+from qa_engine.browser.tools import detect_chrome_channel
+from qa_engine.execution.dry_run import DryRunner, DryRunReport
+from qa_engine.generation.actions import ElementLocator, TestAction
+from qa_engine.generation.testcases import TestCase
+
+LOGIN = """
+<html><head><title>Sign in</title></head><body>
+  <label for="u">Username</label><input id="u" />
+  <label for="p">Password</label><input id="p" type="password" />
+  <button onclick="document.body.insertAdjacentHTML('beforeend', '<h1>Welcome</h1>')">
+    Sign in
+  </button>
+</body></html>
+"""
 
 
-class MockRunner(PytestRunner):
-    def __init__(self, outcomes):
-        self.outcomes = outcomes
-
-    def run_tests(self, test_dir, base_url, retries=0, timeout_seconds=120):
-        failed_count = sum(1 for o in self.outcomes if o.status == "failed")
-        return ExecutionSummary(
-            total_tests=len(self.outcomes),
-            passed=len(self.outcomes) - failed_count,
-            failed=failed_count,
-            outcomes=self.outcomes,
-        )
+def _case(tc_id, actions):
+    return TestCase(
+        tc_id=tc_id,
+        title=tc_id,
+        requirement_ref="REQ-T",
+        steps=["s"],
+        expected_result="e",
+        actions=actions,
+    )
 
 
-def test_dry_run_assertion_invariant(tmp_path):
-    store = RunStore(workspace_root=tmp_path, run_id="run-dry-001")
+def _role(role, name, nth=None):
+    return ElementLocator(by="role", role=role, value=name, nth=nth)
 
-    # Simulate 1 locator timeout failure, and 1 real assertion failure
-    mock_outcomes = [
-        TestCaseOutcome(
-            tc_id="TC-001",
-            status="failed",
-            error_message="TimeoutError: waiting for locator('button.submit')",
-        ),
-        TestCaseOutcome(
-            tc_id="TC-002",
-            status="failed",
-            error_message="AssertionError: assert 'Dashboard' == 'Welcome'",
-        ),
-    ]
 
-    mock_runner = MockRunner(mock_outcomes)
-    stabilizer = DryRunStabilizer(store, mock_runner)
+def _run(case, secrets=None):
+    async def go():
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, channel=detect_chrome_channel())
+            page = await browser.new_page()
+            visited = []
 
-    stabilizer.execute_dry_run(test_dir=tmp_path, base_url="https://test.local")
+            async def navigate(url):
+                visited.append(url)
+                await page.set_content(LOGIN)
 
-    # Invariant checks:
-    # 1. Timing issue was repaired
-    # 2. AssertionError was BLOCKED and NOT auto-repaired!
-    assert "TC-002" in stabilizer.log.blocked_test_cases
-    assert stabilizer.log.total_repairs_attempted == 1
-    assert stabilizer.log.successful_repairs == 1
+            runner = DryRunner("https://app.example/login", secrets, locator_wait_ms=500)
+            try:
+                return await runner.run_case(page, case, navigate), visited
+            finally:
+                await browser.close()
 
-    # Check repair-log.json was written
-    assert (store.run_dir / "repair-log.json").exists()
+    return asyncio.run(go())
 
+
+def test_executable_plan_passes_and_interacts():
+    case = _case(
+        "TC-T-001",
+        [
+            TestAction(action="goto", value=""),
+            TestAction(
+                action="fill",
+                target=ElementLocator(by="label", value="Username"),
+                value="user-{{unique}}",
+            ),
+            TestAction(
+                action="fill",
+                target=ElementLocator(by="label", value="Password"),
+                value="{{secret.PASSWORD}}",
+            ),
+            TestAction(action="click", target=_role("button", "Sign in")),
+            TestAction(action="expect_visible", target=_role("heading", "Welcome")),
+        ],
+    )
+    (result, capture), visited = _run(case, {"password": "pw-value"})
+    assert result.status == "ok", result.issue
+    assert result.steps_checked == result.total_steps == 5
+    assert capture is False
+    assert visited == ["https://app.example/login"]
+
+
+def test_missing_locator_is_reported_with_step_and_capture():
+    case = _case(
+        "TC-T-002",
+        [
+            TestAction(action="goto", value=""),
+            TestAction(action="click", target=_role("button", "Log in now")),
+            TestAction(action="expect_visible", target=_role("heading", "Welcome")),
+        ],
+    )
+    (result, capture), _ = _run(case)
+    assert result.status == "issue"
+    assert result.issue.kind == "not_found"
+    assert result.issue.step == 2
+    assert "Log in now" in result.issue.detail
+    assert capture is True
+
+
+def test_nth_out_of_range_and_absence_assertions():
+    out_of_range = _case(
+        "TC-T-003",
+        [TestAction(action="click", target=_role("button", "Sign in", nth=3))],
+    )
+    (result, _), _ = _run(out_of_range)
+    assert result.issue.kind == "out_of_range"
+    assert result.issue.step == 2  # implicit goto is step 1
+
+    hidden_ok = _case(
+        "TC-T-004",
+        [
+            TestAction(action="goto", value=""),
+            TestAction(action="expect_hidden", target=_role("alert", "Error")),
+            TestAction(action="expect_count", target=_role("dialog", "Popup"), value="0"),
+        ],
+    )
+    (result, _), _ = _run(hidden_ok)
+    assert result.status == "ok"
+
+
+def test_missing_secret_blocks_instead_of_failing():
+    case = _case(
+        "TC-T-005",
+        [
+            TestAction(action="goto", value=""),
+            TestAction(
+                action="fill",
+                target=ElementLocator(by="label", value="Password"),
+                value="{{secret.ADMIN_PASSWORD}}",
+            ),
+        ],
+    )
+    (result, capture), _ = _run(case)
+    assert result.status == "blocked"
+    assert result.missing_secrets == ["ADMIN_PASSWORD"]
+    assert capture is False
+
+
+def test_revision_comments_list_only_broken_steps():
+    report = DryRunReport.model_validate(
+        {
+            "cases": [
+                {"tc_id": "TC-A-001", "status": "ok"},
+                {
+                    "tc_id": "TC-A-002",
+                    "status": "issue",
+                    "issue": {
+                        "tc_id": "TC-A-002",
+                        "step": 3,
+                        "action": "click button 'Go'",
+                        "kind": "not_found",
+                        "detail": "No element matches button 'Go' on this page.",
+                        "page_url": "https://app.example/home",
+                    },
+                },
+            ]
+        }
+    )
+    comments = report.revision_comments()
+    assert "TC-A-002 step 3" in comments
+    assert "TC-A-001" not in comments
+    assert "Keep every other" in comments
+    assert len(report.issues) == 1

@@ -50,4 +50,3 @@ class InvestigationReport(BaseModel):
     gate_2_signed_off: bool = False
     signed_off_by: Optional[str] = None
     signoff_notes: Optional[str] = None
-

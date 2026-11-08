@@ -76,6 +76,9 @@ class TestCaseDiffEngine:
             "expected_result",
             "postconditions",
             "automation_candidate",
+            "ac_ref",
+            "test_types",
+            "actions",
         ]
 
         for tc_id, old_tc in old_map.items():

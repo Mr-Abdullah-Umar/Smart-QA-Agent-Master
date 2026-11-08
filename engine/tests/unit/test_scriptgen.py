@@ -18,7 +18,7 @@ def test_script_generation_and_validation(tmp_path):
         expected_result="Header is displayed",
     )
 
-    scripts = ScriptGenerator.write_scripts(store, [tc1], page_name="home")
+    scripts = ScriptGenerator.write_scripts(store.run_dir / "scripts", [tc1], "home")
 
     assert scripts["page"].exists()
     assert scripts["test"].exists()

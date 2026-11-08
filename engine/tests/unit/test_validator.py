@@ -71,4 +71,3 @@ def test_unapproved(page: Page):
     is_valid, errors = ScriptValidator.validate_code(code, approved_tc_ids={"TC-APPROVED-001"})
     assert is_valid is False
     assert any("unapproved test case IDs" in err for err in errors)
-

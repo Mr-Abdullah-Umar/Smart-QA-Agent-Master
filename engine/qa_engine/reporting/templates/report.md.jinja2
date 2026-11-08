@@ -1,6 +1,7 @@
 # QA Harness Execution Report: `{{ run_id }}`
 
-**Generated At:** {{ generated_at }}  
+{% if module %}**Module:** {{ module }} | **Run Type:** {{ run_type }}{% if environment %} | **Environment:** {{ environment }}{% endif %}{% if triggered_by %} | **Triggered By:** {{ triggered_by }}{% endif %}  
+{% endif %}**Generated At:** {{ generated_at }}  
 **Target URL:** `{{ target_url }}`  
 {% if gate_1_hash %}**Gate 1 Hash:** `{{ gate_1_hash }}`  {% endif %}
 
@@ -8,18 +9,18 @@
 
 ## 1. Executive Summary
 
-| Total Tests | Passed | Failed | Flaky | Pass Rate | Total Duration |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| **{{ total_tests }}** | {{ passed }} | {{ failed }} | {{ flaky }} | **{{ "%.1f"|format(pass_rate) }}%** | {{ "%.2f"|format(duration_seconds) }}s |
+| Total Tests | Passed | Failed | Flaky | Blocked | Pass Rate | Total Duration |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **{{ total_tests }}** | {{ passed }} | {{ failed }} | {{ flaky }} | {{ blocked }} | **{{ "%.1f"|format(pass_rate) }}%** | {{ "%.2f"|format(duration_seconds) }}s |
 
 ---
 
 ## 2. Test Execution Outcomes
 
-| ID | Title | Priority | Category | Status | Duration |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-{% for tc in test_outcomes %}
-| `{{ tc.tc_id }}` | {{ tc.title }} | {{ tc.priority }} | {{ tc.category }} | **{{ tc.status }}** | {{ "%.2f"|format(tc.duration_seconds) }}s |
+| ID | Title | AC | Priority | Category | Status | Duration |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+{% for tc in test_outcomes -%}
+| `{{ tc.tc_id }}` | {{ tc.title }} | {{ tc.ac_ref or "-" }} | {{ tc.priority }} | {{ tc.category }} | **{{ tc.status }}** | {{ "%.2f"|format(tc.duration_seconds) }}s |
 {% endfor %}
 
 ---
@@ -35,17 +36,17 @@
 {% endif %}
 
 #### Observed Facts (Verified Evidence Citations)
-{% for fact in inv.facts %}
+{% for fact in inv.facts -%}
 * `[{{ fact.evidence_id }}]` {{ fact.statement }}
 {% endfor %}
 
 {% if inv.hypotheses %}
 #### Hypotheses
-{% for hyp in inv.hypotheses %}
+{% for hyp in inv.hypotheses -%}
 * {{ hyp.hypothesis }}
-{% if hyp.supporting_indicators %}
+{% if hyp.supporting_indicators -%}
   * *Indicators:* {{ hyp.supporting_indicators|join(', ') }}
-{% endif %}
+{% endif -%}
 {% endfor %}
 {% endif %}
 
@@ -63,7 +64,7 @@
 ### Accessibility Violations (WCAG 2.1 AA)
 | Rule ID | Impact | Description | Selector |
 | :--- | :--- | :--- | :--- |
-{% for a11y in extended_checks.accessibility_violations %}
+{% for a11y in extended_checks.accessibility_violations -%}
 | `{{ a11y.rule_id }}` | **{{ a11y.impact }}** | {{ a11y.description }} | `{{ a11y.selector }}` |
 {% endfor %}
 {% endif %}

@@ -110,19 +110,64 @@ class RPCDispatcher:
             return None
 
 
+class RemoteRPCError(Exception):
+    """Raised when the extension answers an engine-initiated request with an error."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 class StdioChannel:
     """Async wrapper around sys.stdin and sys.stdout for line-delimited JSON-RPC.
 
     Uses an executor thread for reading sys.stdin to guarantee cross-platform
     compatibility across Windows, Linux, and macOS without IOCP pipe handle errors.
+    Supports both directions: extension -> engine requests are dispatched by the server,
+    engine -> extension requests (e.g. LLM calls, secret lookups) await matching responses.
     """
 
     def __init__(self):
         self._writer_lock = asyncio.Lock()
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._next_request_id = 1
+
+    async def request(
+        self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 300.0
+    ) -> Any:
+        """Send an engine -> extension request and wait for its response."""
+        request_id = f"engine-{self._next_request_id}"
+        self._next_request_id += 1
+        future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+        payload = json.dumps(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
+        )
+        try:
+            await self._write_raw(payload)
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending.pop(request_id, None)
+
+    def resolve_response(self, message: Dict[str, Any]) -> bool:
+        """Complete a pending engine-initiated request. Returns False if unknown."""
+        future = self._pending.get(str(message.get("id")))
+        if future is None or future.done():
+            return False
+        error = message.get("error")
+        if error:
+            future.set_exception(
+                RemoteRPCError(int(error.get("code", INTERNAL_ERROR)), str(error.get("message")))
+            )
+        else:
+            future.set_result(message.get("result"))
+        return True
 
     async def initialize(self) -> None:
-        """Portable initialization."""
-        pass
+        """Force UTF-8 pipes (Windows defaults to the ANSI code page)."""
+        for stream in (sys.stdin, sys.stdout):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
 
     async def read_line(self) -> Optional[str]:
         loop = asyncio.get_running_loop()

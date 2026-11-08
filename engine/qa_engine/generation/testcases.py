@@ -11,7 +11,20 @@ import json
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from qa_engine.generation.actions import TestAction, describe_action
+
+TEST_TYPES = (
+    "smoke",
+    "sanity",
+    "regression",
+    "functional",
+    "negative",
+    "boundary",
+    "ui",
+    "accessibility",
+)
 
 
 class TestCaseCategory(str, Enum):
@@ -57,8 +70,28 @@ class TestCase(BaseModel):
     postconditions: Optional[str] = Field(default=None, description="State to restore after test")
     automation_candidate: bool = True
     automation_rationale: Optional[str] = None
+    ac_ref: Optional[str] = Field(default=None, description="Acceptance criterion, e.g. AC-2")
+    test_types: List[str] = Field(
+        default_factory=list, description=f"Subset of: {', '.join(TEST_TYPES)}"
+    )
+    actions: List[TestAction] = Field(
+        default_factory=list, description="Executable browser action plan for automation"
+    )
     version: int = 1
     status: str = "draft"  # "draft", "approved", "rejected"
+
+    @field_validator("test_types", mode="before")
+    @classmethod
+    def _normalize_types(cls, value):
+        items = value or []
+        if isinstance(items, str):
+            items = [items]
+        normalized = []
+        for item in items:
+            key = str(item).strip().lower()
+            if key in TEST_TYPES and key not in normalized:
+                normalized.append(key)
+        return normalized
 
 
 class CoverageMatrixItem(BaseModel):
@@ -98,6 +131,9 @@ class TestCaseCollection(BaseModel):
                     "expected_result": tc.expected_result,
                     "postconditions": tc.postconditions,
                     "automation_candidate": tc.automation_candidate,
+                    "ac_ref": tc.ac_ref,
+                    "test_types": tc.test_types,
+                    "actions": [a.model_dump(mode="json") for a in tc.actions],
                 }
             )
         canonical_str = json.dumps(canonical_list, sort_keys=True, separators=(",", ":"))
@@ -123,6 +159,10 @@ class TestCaseCollection(BaseModel):
             md_lines.append(f"## {tc.tc_id}: {tc.title}")
             md_lines.append("")
             md_lines.append(f"- **Requirement Reference:** {tc.requirement_ref}")
+            if tc.ac_ref:
+                md_lines.append(f"- **Acceptance Criterion:** {tc.ac_ref}")
+            if tc.test_types:
+                md_lines.append(f"- **Test Types:** {', '.join(tc.test_types)}")
             md_lines.append(f"- **Category:** {tc.category.value}")
             md_lines.append(
                 f"- **Priority:** {tc.priority.value}"
@@ -153,6 +193,12 @@ class TestCaseCollection(BaseModel):
             md_lines.append("### Expected Result")
             md_lines.append(tc.expected_result)
             md_lines.append("")
+
+            if tc.actions:
+                md_lines.append("### Automation Plan")
+                for idx, action in enumerate(tc.actions, start=1):
+                    md_lines.append(f"{idx}. `{describe_action(action)}`")
+                md_lines.append("")
 
             if tc.postconditions:
                 md_lines.append("### Postconditions")

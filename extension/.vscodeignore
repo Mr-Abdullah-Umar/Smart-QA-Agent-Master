@@ -1,7 +1,12 @@
 .vscode/**
 src/**
+scripts/**
 tsconfig.json
 test-integration.js
+test/**
+*.log
+*.vsix
 **/*.map
-node_modules/@vscode/vsce/**
-
+**/__pycache__/**
+**/*.pyc
+node_modules/**

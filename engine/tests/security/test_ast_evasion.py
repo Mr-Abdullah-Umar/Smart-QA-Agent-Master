@@ -98,9 +98,9 @@ def test_ast_security_evasion_attempts(title, code, expected_error):
     """Verify that ASTSecurityValidator intercepts each evasion vector."""
     result = ASTSecurityValidator.validate_script(code)
     assert not result.is_valid, f"Expected validator to fail for: {title}"
-    assert any(
-        expected_error.lower() in err.lower() for err in result.errors
-    ), f"Expected '{expected_error}' in {result.errors}"
+    assert any(expected_error.lower() in err.lower() for err in result.errors), (
+        f"Expected '{expected_error}' in {result.errors}"
+    )
 
 
 def test_valid_playwright_test_script_passes():

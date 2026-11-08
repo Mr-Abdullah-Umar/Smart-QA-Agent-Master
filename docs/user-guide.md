@@ -1,124 +1,215 @@
-# AI QA Testing Harness - User Guide
+# AI QA Testing Harness - User Guide (v0.3.0)
 
-The **AI QA Testing Harness** is an enterprise-grade extension for Visual Studio Code paired with a deterministic, policy-guarded Python automation engine. It automates web application exploratory testing, test case design, Page Object Model (POM) script generation, sandboxed execution, root-cause investigation, and reporting without pixel guessing, brittle locators, or unauthorized testing.
+Write a requirement and its acceptance criteria, and the harness designs a **test suite** for that
+module, lets you review and approve it, generates Playwright tests, runs them in a real browser, and
+keeps the suite so you can **retest** it or include it in a **regression** run later.
 
----
-
-## 1. System Requirements & Prerequisites
-
-* **Operating System:** Windows 10/11, macOS 12+, or modern Linux (Ubuntu 20.04+).
-* **Visual Studio Code:** Version `^1.88.0` or higher.
-* **Python Runtime:** Python `3.10`, `3.11`, or `3.12`.
-* **Playwright Chromium:** Headless browser binaries installed via Playwright CLI.
+Nothing is tied to a particular website: every target URL, allowed domain, module name, credential,
+and AI model comes from you at run time.
 
 ---
 
-## 2. Installation & Quick Start
+## 1. Requirements
 
-### Step 1: Install the VS Code Extension
-Install the pre-built `.vsix` package:
-```bash
-code --install-extension extension/ai-qa-testing-harness-0.1.0.vsix
-```
+* VS Code `1.94` or newer.
+* Python `3.10` to `3.12` on the PATH (only needed once, for **Set Up Engine**).
+* Google Chrome or Microsoft Edge for headed runs (Playwright's Chromium is used as a fallback).
+* An AI provider for requirement-driven design: GitHub Copilot in VS Code, or an API key.
 
-### Step 2: Configure the Python Engine Virtual Environment
-From the repository root or `engine/` folder:
-```bash
-cd engine
-python -m venv .venv
-# On Windows:
-.venv\Scripts\activate
-# On macOS/Linux:
-source .venv/bin/activate
+## 2. Install and set up
 
-pip install -r requirements.txt
-playwright install chromium
-```
+1. Install the extension package:
+   ```bash
+   code --install-extension extension/ai-qa-testing-harness-0.3.0.vsix
+   ```
+2. Open the folder you want to keep test suites in (VS Code must trust the folder).
+3. Click the **QA Harness** beaker in the Activity Bar.
+4. If the panel shows *"Engine not set up"*, click **Set Up Engine**. It creates a private Python
+   environment for the extension, installs the engine's dependencies, and downloads Playwright's Chromium.
+   You only do this once per machine.
 
-### Step 3: Configure Extension Settings (Optional)
-In VS Code Settings (`Ctrl+,` or `Cmd+,`), search for **QA Harness**:
-* `qaHarness.pythonPath`: Custom absolute path to Python interpreter (defaults automatically to `.venv/Scripts/python.exe` or `.venv/bin/python`).
-* `qaHarness.requireScriptApproval`: Set to `true` if you wish to inspect and approve generated pytest code before test execution.
+The extension looks for the engine in this order: the `qaHarness.enginePath` setting, an `engine/`
+folder in the open workspace, then the copy bundled inside the extension. Python is resolved from the
+`qaHarness.pythonPath` setting, `engine/.venv`, the workspace `.venv`, then the private environment.
 
----
+## 3. Connect an AI provider (AI Provider tab)
 
-## 3. Workflow & The Three Human Approval Gates
-
-The QA Harness executes an 11-stage deterministic workflow governed by three strict Human Approval Gates:
-
-```
-[Stage 0: Scope Card] --> [GATE 0: Human Attestation]
-         │
-[Stage 1: Intake & PII Redaction]
-         │
-[Stage 2: Analysis & Clarifications]
-         │
-[Stage 3: ARIA Semantic Exploration]
-         │
-[Stage 4: Appendix A Test Design]
-         │
-[Stage 5: Review Loop] --> [GATE 1: SHA-256 Approval Hash]
-         │
-[Stage 6: POM Script Gen & AST Validation]
-         │
-[Stage 7: Dry Run Locator Stabilization]
-         │
-[Stage 8: Sandboxed Execution & Retries]
-         │
-[Stage 9: AI Failure Investigation & Evidence]
-         │
-[Stage 10: Sign-Off] --> [GATE 2: Human Defect Confirmation]
-         │
-[Multi-Format Reporting: Zero-JS HTML, Markdown, JSON, JUnit XML]
-```
-
-### Gate 0: Scope Attestation & Legal Authorization
-* **Trigger:** Click the **QA Assistant** beaker icon in the Activity Bar, then click **Start New Run** (or run `QA Harness: Start New Run`).
-* **Requirements:**
-  1. Specify the Target Start URL (e.g., `https://staging.myapp.com`).
-  2. Define the explicit Domain Allowlist (e.g., `staging.myapp.com, cdn.myapp.com`).
-  3. Select Environment tier (`development`, `staging`, `production`).
-  4. **Mandatory Checkbox:** *"I attest that I am authorized to test this target URL."*
-* **Security Control:** SSRF and DNS rebinding protections abort any outbound traffic outside approved domains or targeting internal IP ranges (`127.0.0.1`, RFC 1918, `169.254.169.254`).
-
-### Gate 1: Test Case Review & Cryptographic Hash Binding
-* **Trigger:** Following exploratory profiling, the engine drafts structured test cases adhering to Appendix A.
-* **Review Interface:**
-  - View test cases with priority, preconditions, steps, and expected results.
-  - Submit comments or request revisions (triggers semantic diffing between `v1` and `v2`).
-  - Click **Approve Test Cases**.
-* **Integrity Guarantee:** Approval records a SHA-256 hash in `approvals.json` and the tamper-evident audit log. If test cases are modified downstream, the engine halts execution.
-
-### Gate 2: Product Defect Human Sign-Off
-* **Trigger:** When a test failure occurs during execution, the AI Investigation engine conducts Root Cause Analysis (RCA) conforming to Appendix B.
-* **Review Interface:**
-  - Observed facts are strictly segregated from hypotheses.
-  - Every fact cites a verified on-disk evidence ID (`[EV-001]`).
-  - If classified as `Product defect`, the test result **CANNOT** automatically file a bug ticket until a human QA engineer checks the evidence and explicitly confirms the defect.
-
----
-
-## 4. Test Credentials & Secret Management
-
-Sensitive test credentials (passwords, API tokens) must **never** be hardcoded in scripts or pasted into LLM prompts.
-
-1. Run command: `Ctrl+Shift+P > QA Harness: Store Test Credentials`.
-2. Enter the key name (e.g. `TEST_ADMIN_PASSWORD`) and value.
-3. Credentials are saved encrypted into the OS keychain using VS Code's `SecretStorage`.
-4. The Python engine automatically references credentials through fixtures, and the PII Redaction scanner masks secrets prior to sending prompts to the LLM.
-
----
-
-## 5. Artifacts and Reports
-
-Every run produces an isolated run directory in `.qa-harness/runs/<run-id>/`:
-
-| Artifact Path | Description |
+| Provider | What you enter |
 | :--- | :--- |
-| `report/report.html` | Self-contained, zero-JavaScript HTML report. CSP-compliant with print stylesheet. |
-| `report/report.md` | Markdown report formatted for GitHub/GitLab pull requests or issues. |
-| `report/report.json` | Complete machine-readable test execution and failure investigation data. |
-| `report/junit.xml` | Standard JUnit XML format compatible with GitHub Actions, GitLab CI, and Jenkins. |
-| `evidence/` | Raw screenshots, Playwright trace zip files, network HAR files, and logs. |
-| `audit.jsonl` | Tamper-evident SHA-256 hash-chained log recording all actions and gate sign-offs. |
+| GitHub Copilot (default) | Nothing. Uses your Copilot subscription through VS Code. Accept the consent prompt on first use. |
+| OpenAI | API key |
+| Azure OpenAI | Resource endpoint (`https://<resource>.openai.azure.com`), API key, deployment name as the model |
+| Anthropic | API key |
+| Google Gemini | API key |
+| GitHub Models | Fine-grained GitHub token with **Models: read** permission; model IDs look like `openai/gpt-4.1` |
+| OpenAI-compatible | HTTPS base URL and API key |
+| None | Nothing. Only smoke suites built from page structure are available. |
 
+1. Pick the provider, paste the key if one is needed, and click **Save**.
+2. Click **Load models** to list the models your account can use, then pick one (leave empty for Copilot's default).
+3. Click **Test** to confirm the connection.
+
+Keys are stored in VS Code's encrypted SecretStorage (the OS keychain). They are never written to
+files, logs, or prompts. Custom endpoints must use HTTPS. Models that do not accept a `temperature`
+setting (some reasoning models) are retried automatically without it.
+
+## 4. Approver identity
+
+Approvals (scope, test cases, defects, retests, regressions) are recorded under your **GitHub account
+name**. Click the user chip at the top of the panel, use the **GitHub account** card in the AI Provider tab,
+or run `QA Harness: Sign In / Switch GitHub Account (Approver)`. The account menu lets you:
+
+* pick any GitHub account already signed into VS Code,
+* **Sign in with another GitHub account** (if GitHub signs you in as the same user again, switch accounts
+  on github.com in your browser first),
+* **Sign out**, which stops the QA Harness from using the account (also `QA Harness: Sign Out GitHub
+  Account (Approver)`). To remove the account from VS Code completely, use the Accounts menu (person icon,
+  bottom left) and choose Sign Out.
+
+GitHub Copilot uses the account signed into the GitHub Copilot extension, which can be different from the
+approver. Change the Copilot account from the VS Code Accounts menu.
+
+## 5. Create a test suite (Suites tab, "New Suite")
+
+Fill in:
+
+* **Module**: the feature under test, e.g. `User Login`. It becomes the suite name and the test case ID
+  prefix (`TC-USER-LOGIN-001`).
+* **Start URL**: the page where testing begins. Localhost and private network addresses are blocked.
+* **Allowed domains**: comma-separated hosts the browser may visit (defaults to the start URL's host).
+* **Environment**: any name, e.g. `dev`, `test`, `staging`, `uat` (letters, digits, `.`, `_`, `-`).
+* **Requirement** and **Acceptance criteria**: one criterion per line. They are numbered `AC-1`, `AC-2`, ...
+* **Use AI**: on for requirement-driven design; off for a smoke suite from the page structure.
+* **Dry run**: on by default. Every step is tried once on the live page before the real run (see step 5).
+
+Then the workflow runs in the **Assistant** tab:
+
+1. **Scope card (Gate 0)**: check the domains and environment, tick the authorization attestation, confirm.
+2. **Clarifications**: the AI may ask up to 5 questions about the requirement. Answer or skip.
+3. **Exploration**: the browser opens the start page and up to 4 relevant in-scope pages and records their
+   accessibility tree (headed mode shows this live).
+4. **Review card (Gate 1)**: each case shows its acceptance criterion, priority, test types (smoke, sanity,
+   regression, functional, negative, boundary, ui, accessibility), steps, and its automation plan.
+   The card also lists AC coverage, required secrets, and locators that were not seen on the explored pages.
+   Use **Request changes** to have the AI revise (a new version with a diff), or **Approve**.
+5. **Dry run (Stage 7)**: each approved case is replayed once in a fresh browser context. Every locator must
+   exist on the live page and every click, fill, or navigation must succeed; assertions are not judged yet.
+   If a step cannot be performed (element not found, index out of range, action failed, navigation blocked),
+   a **Dry run** card lists each problem with a screenshot, and you choose:
+   * **Fix with AI**: the AI repairs only the broken steps using the pages where they failed. Your Gate 1
+     approval is withdrawn (recorded in the audit log) and the repaired version comes back for review.
+   * **Run anyway**: execute the suite as approved; the broken steps will fail in the report.
+   * **Cancel**: stop the run.
+   Cases whose secrets are missing are skipped by the dry run and reported as blocked.
+6. **Generation and execution**: approved cases are compiled into Page Object + pytest code, checked by the
+   AST security gate, and run in the browser.
+7. **Report card**: pass/fail/flaky/blocked counts, investigation of failures, and links to the HTML report.
+   Failures that look like product defects need your sign-off (Gate 2) before they count as defects.
+
+The approved suite is saved to `.qa-harness/suites/<module>/` in your workspace.
+
+## 6. Updating or deleting a suite
+
+* **Update** (suite card, or `QA Harness: Update Suite`) opens the form with the stored requirement, criteria,
+  URL, and domains. Edit the requirement or criteria and submit. The AI revises the approved suite: cases
+  that still apply keep their IDs, changed criteria get updated cases, new criteria get new cases, and
+  removed criteria lose theirs. The review card shows the changes against the approved version, and the
+  new version is saved only after you approve it (the run appears as an **update** in the history).
+* **Delete** (suite card, or `QA Harness: Delete Suite`) asks for confirmation, then moves the suite and its
+  run history to `.qa-harness/archive/suites/` (nothing is erased; `archive-log.json` records who deleted it
+  and when) and removes the suite's stored secrets from the keychain. A suite cannot be deleted while it is
+  running or being updated.
+
+## 7. Retesting a module
+
+On a suite card in the **Suites** tab:
+
+* **Retest all** re-runs every case of the module.
+* **Retest failed** re-runs only the cases that failed, were flaky, or were blocked in the last run.
+
+You then pick the **environment**: the suite's default, an environment saved earlier, or **Another
+environment** (a name plus the same start page on that environment's host, e.g.
+`https://staging.your-app.example/login`). The new environment is saved on the suite for next time. The
+approved scripts are not changed: the original host is mapped to the environment's host at run time, and the
+browser is allowed only on that host plus the suite's other allowed domains. Localhost and private
+addresses are refused here too.
+
+Retests reuse the approved suite without redesigning it. Before each run, the stored test cases and scripts
+are checked against their approved SHA-256 hashes and the scripts are re-validated; a modified suite is
+refused. You confirm authorization for every retest.
+
+## 8. Regression
+
+In the **Suites** tab, choose a test-type filter (all cases, or only smoke, sanity, regression, functional,
+negative, boundary, ui, or accessibility cases) and click **Run regression**. Then choose the environment:
+each suite's default, or one environment name for all suites. Suites that do not have that environment are
+listed as *not run* in the report instead of running somewhere else.
+
+Every selected suite runs one after another, and a combined regression report is written to
+`.qa-harness/regressions/<id>/` (HTML, Markdown, JSON). The report lists, for each module, which cases are
+**newly failing** and which are **fixed** compared with the previous run.
+
+## 9. Secrets for tests (logins, tokens)
+
+When a test needs a credential, the AI writes a placeholder such as `{{secret.USERNAME}}` instead of a value.
+Before a run, the extension asks for any missing values and stores them per suite in SecretStorage. Use the
+**Secrets** button on a suite card (or `QA Harness: Manage Suite Secrets`) to change or remove them.
+
+Values reach only the test process as `QA_SECRET_<NAME>` environment variables and are replaced with
+`[MASKED-SECRET]` in logs and reports. A test whose secret is missing is reported as **BLOCKED**, not failed.
+
+## 10. Command-line runner (no VS Code, CI)
+
+From a workspace folder (Windows: `qa-harness.bat`, or `python -m qa_engine.cli` with the engine on `PYTHONPATH`).
+`--workspace <dir>` goes before the command; `--approver` can come from the `QA_APPROVER` variable.
+
+```bash
+# Requirement-driven AI suite (needs the QA_AI_* variables below)
+qa-harness suite --url https://your-app.example/login --module "User Login" --environment test \
+  --requirement-file login.md --criteria-file login-ac.txt --approver your-github-name
+
+qa-harness smoke --url https://your-app.example --module "Home page" --environment staging --approver your-github-name --yes
+qa-harness list
+qa-harness retest --module "User Login" --approver your-github-name --yes
+qa-harness retest --module "User Login" --failed-only --environment uat --base-url https://uat.your-app.example/login --approver your-github-name --yes
+qa-harness regression --tag smoke --environment uat --approver your-github-name --yes
+qa-harness delete --module "Home page" --approver your-github-name --yes
+```
+
+`suite` shows the clarification questions, the designed cases, and any dry-run problems in the terminal and
+asks you to approve, request changes, fix, or quit. With `--yes` it leaves the questions unanswered, approves
+the first version, and runs anyway when the dry run finds problems (those steps then fail and the exit code
+is `3`). Use `--yes` for `suite` only in CI for requirements you have reviewed before.
+
+The CLI's AI provider is configured with environment variables (the key never goes into files or arguments):
+
+| Variable | Value |
+| :--- | :--- |
+| `QA_AI_PROVIDER` | `openai`, `azure-openai`, `anthropic`, `gemini`, `github-models`, or `openai-compatible` |
+| `QA_AI_API_KEY` | API key (`github-models` also accepts `GITHUB_TOKEN`, e.g. in GitHub Actions with `models: read`) |
+| `QA_AI_MODEL` | Model ID (Azure: deployment name; GitHub Models: e.g. `openai/gpt-4.1`) |
+| `QA_AI_BASE_URL` | HTTPS endpoint; required for `azure-openai` and `openai-compatible` |
+| `QA_AI_AZURE_API_VERSION` | Azure REST api-version (default `2024-10-21`) |
+
+Other options: `--domains`, `--headless`, `--slowmo <ms>`, `--channel chrome|msedge`, `--no-dry-run`.
+`--yes` records your authorization attestation. Secrets come from `QA_SECRET_<NAME>` environment variables.
+Exit codes: `0` all passed, `3` test failures, `2` error, `1` cancelled.
+
+## 11. Settings
+
+| Setting | Purpose |
+| :--- | :--- |
+| `qaHarness.ai.provider` / `ai.model` / `ai.baseUrl` / `ai.azureApiVersion` | AI provider (also editable in the AI Provider tab) |
+| `qaHarness.headed` | Show the browser window (default on) |
+| `qaHarness.slowMoMs` | Delay between browser actions in headed mode |
+| `qaHarness.browserChannel` | `chrome`, `msedge`, or empty for bundled Chromium |
+| `qaHarness.enginePath` / `qaHarness.pythonPath` | Override engine folder or interpreter |
+
+## 12. Where things are stored
+
+| Path | Contents |
+| :--- | :--- |
+| `.qa-harness/suites/<module>/` | Suite record (with saved environments), approved test case versions, approval, scripts, run history |
+| `.qa-harness/runs/<run-id>/` | Per-run scripts, `dry_run.json`, evidence (screenshots, traces), `audit.jsonl`, and `report/` (HTML, MD, JSON, JUnit) |
+| `.qa-harness/regressions/<id>/` | Combined regression reports |
+| `.qa-harness/archive/suites/` | Deleted suites and `archive-log.json` |

@@ -1,17 +1,8 @@
-# Core Data Modeling and Validation
+# Runtime dependencies of the QA engine (installed by "QA Harness: Set Up Engine")
 pydantic>=2.7.0
-
-# Browser Automation and Testing
 playwright>=1.44.0
 pytest>=8.2.0
 pytest-playwright>=0.5.0
 pytest-asyncio>=0.23.0
-
-# Reporting and Safe Templating
 jinja2>=3.1.4
-
-# Security, Linting and Dependency Auditing
-ruff>=0.4.0
-bandit>=1.7.8
-pip-audit>=2.7.3
-
+defusedxml>=0.7.1

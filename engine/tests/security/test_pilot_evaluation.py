@@ -103,7 +103,7 @@ async def test_complete_pilot_workflow_and_benchmarks(tmp_path):
 
     # Step 6: Script Generation & AST Security Validation
     generated_dict = ScriptGenerator.write_scripts(
-        store, collection.testcases, page_name="checkout"
+        store.run_dir / "scripts", collection.testcases, "checkout"
     )
     assert len(generated_dict) == 2  # page object + test script
 

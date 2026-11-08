@@ -12,8 +12,11 @@ import {
   RPCError,
 } from "./protocol";
 
+export type RequestHandler = (params: Record<string, unknown>) => Promise<unknown>;
+
 export class RPCClient extends EventEmitter {
   private nextId = 1;
+  private readonly requestHandlers = new Map<string, RequestHandler>();
   private pendingRequests = new Map<
     string | number,
     {
@@ -82,6 +85,12 @@ export class RPCClient extends EventEmitter {
         return;
       }
 
+      // Engine -> extension request (e.g. llm.chat, secrets.resolve)
+      if ("method" in parsed && "id" in parsed && parsed.id !== null) {
+        void this.handleIncomingRequest(parsed as RPCRequest);
+        return;
+      }
+
       // Check if notification
       if ("method" in parsed && !("id" in parsed && parsed.id !== null)) {
         const notification = parsed as RPCNotification;
@@ -92,6 +101,30 @@ export class RPCClient extends EventEmitter {
     } catch (e) {
       this.emit("error", new Error(`Failed to parse RPC line: ${e}`));
     }
+  }
+
+  public onRequest(method: string, handler: RequestHandler): void {
+    this.requestHandlers.set(method, handler);
+  }
+
+  private async handleIncomingRequest(request: RPCRequest): Promise<void> {
+    const handler = this.requestHandlers.get(request.method);
+    let reply: RPCResponse;
+    if (!handler) {
+      reply = {
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32601, message: `Method not found: '${request.method}'` },
+      };
+    } else {
+      try {
+        reply = { jsonrpc: "2.0", id: request.id, result: await handler(request.params || {}) };
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        reply = { jsonrpc: "2.0", id: request.id, error: { code: -32000, message } };
+      }
+    }
+    this.stdinStream.write(JSON.stringify(reply) + "\n", "utf-8");
   }
 
   public sendRequest<T = unknown>(
