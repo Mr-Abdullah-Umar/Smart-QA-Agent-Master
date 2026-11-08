@@ -1,0 +1,82 @@
+{
+  "name": "ai-qa-testing-harness",
+  "displayName": "AI QA Testing Harness",
+  "description": "Advanced AI QA Testing Harness for Visual Studio Code",
+  "version": "0.1.0",
+  "publisher": "qa-engineering",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Testing",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "qa-harness",
+          "title": "QA Harness",
+          "icon": "$(beaker)"
+        }
+      ]
+    },
+    "views": {
+      "qa-harness": [
+        {
+          "type": "webview",
+          "id": "qaHarness.chatView",
+          "name": "QA Assistant"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "qaHarness.startRun",
+        "title": "Start New Run",
+        "category": "QA Harness"
+      },
+      {
+        "command": "qaHarness.cancelRun",
+        "title": "Cancel Current Run",
+        "category": "QA Harness"
+      },
+      {
+        "command": "qaHarness.setCredentials",
+        "title": "Store Test Credentials",
+        "category": "QA Harness"
+      }
+    ],
+    "configuration": {
+      "title": "AI QA Testing Harness",
+      "properties": {
+        "qaHarness.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Python interpreter for the QA Engine (defaults to engine/.venv)."
+        },
+        "qaHarness.requireScriptApproval": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require explicit human approval on script preview card before execution."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/ai-qa-testing-harness"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/vscode": "^1.88.0",
+    "@vscode/vsce": "^4.1.0",
+    "typescript": "^5.4.5"
+  }
+}
