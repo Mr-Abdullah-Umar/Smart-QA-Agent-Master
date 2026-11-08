@@ -331,7 +331,7 @@ def test_empty_credentials(page: Page):
         "-s",
         "--tb=short",
         "--headed",
-        "--browser=chromium",
+        "--browser-channel=chrome",
         "--slowmo=1500",
     ]
 

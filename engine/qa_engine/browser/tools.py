@@ -42,11 +42,13 @@ class GuardedBrowserSession:
         policy_mode: str = "require_approval",
         headless: bool = True,
         evidence_dir: Optional[Path] = None,
+        channel: Optional[str] = "chrome",
     ):
         self.allowed_domains = allowed_domains
         self.policy_mode = policy_mode
         self.headless = headless
         self.evidence_dir = evidence_dir
+        self.channel = channel
 
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -59,12 +61,16 @@ class GuardedBrowserSession:
         self.failed_requests: List[Dict[str, Any]] = []
 
     async def initialize(self) -> None:
-        """Launch headless Chromium with isolated context and SSRF route interception."""
+        """Launch Chromium/Chrome with isolated context and SSRF route interception."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=["--disable-dev-shm-usage", "--no-sandbox"],
-        )
+        launch_kwargs = {
+            "headless": self.headless,
+            "args": ["--disable-dev-shm-usage", "--no-sandbox"],
+        }
+        if self.channel:
+            launch_kwargs["channel"] = self.channel
+
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
             ignore_https_errors=False,
