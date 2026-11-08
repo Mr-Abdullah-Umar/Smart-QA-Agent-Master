@@ -101,7 +101,7 @@ async def main():
 
     session = GuardedBrowserSession(
         allowed_domains=["the-internet.herokuapp.com"],
-        headless=True,
+        headless=False,
         evidence_dir=screenshots_dir,
     )
     await session.initialize()
@@ -110,6 +110,7 @@ async def main():
     snapshot = await session.navigate("https://the-internet.herokuapp.com/login")
     initial_shot = await session.screenshot("live_login_initial.png")
     print(f" -> Initial page screenshot captured: {initial_shot.name}")
+    await asyncio.sleep(2)
 
     page = session._page
     a11y_violations = await ExtendedChecksCollector.collect_accessibility(page)
@@ -315,6 +316,8 @@ def test_empty_credentials(page: Page):
         f"--junitxml={junit_xml}",
         "-v",
         "--tb=short",
+        "--headed",
+        "--slowmo=1000",
     ]
 
     extra_env = {"PYTHONPATH": str(store.run_dir / "scripts")}
