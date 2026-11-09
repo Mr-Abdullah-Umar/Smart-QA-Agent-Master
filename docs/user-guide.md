@@ -1,4 +1,4 @@
-# AI QA Testing Harness - User Guide (v0.4.0)
+# AI QA Testing Harness - User Guide (v0.5.0)
 
 Write a requirement and its acceptance criteria, and the harness designs a **test suite** for that
 module, lets you review and approve it, generates Playwright tests, runs them in a real browser, and
@@ -20,7 +20,7 @@ and AI model comes from you at run time.
 
 1. Install the extension package:
    ```bash
-   code --install-extension extension/ai-qa-testing-harness-0.4.0.vsix
+   code --install-extension extension/ai-qa-testing-harness-0.5.0.vsix
    ```
 2. Open the folder you want to keep test suites in (VS Code must trust the folder).
 3. Click the **QA Harness** beaker in the Activity Bar.
@@ -31,6 +31,38 @@ and AI model comes from you at run time.
 The extension looks for the engine in this order: the `qaHarness.enginePath` setting, an `engine/`
 folder in the open workspace, then the copy bundled inside the extension. Python is resolved from the
 `qaHarness.pythonPath` setting, `engine/.venv`, the workspace `.venv`, then the private environment.
+
+### The panel at a glance
+
+* **Agent steps.** While a run is active, the Assistant tab shows each step the agent takes:
+  *reading* the requirement, *thinking* (every AI call: analysis, page choice, design, revision),
+  *browsing* pages, *waiting* for you at a gate, *generating* tests, the *AST security gate*, the
+  *dry run*, *running* tests (live `3/6 · 2 passed` progress with the pytest output attached),
+  *investigating* failures, and *building reports*. Each step shows its result and duration. Groups of
+  finished steps collapse to "Completed N steps"; click to expand.
+* **Stage track.** The bar under the run title shows where the run is: Scope, Analyze, Explore,
+  Design, Review, Dry run, Execute, Report. Retests and regressions skip the design stages.
+* **Run history.** Every execution (new suite, suite update, retest, failed-case retest, regression)
+  is its own entry in the history sidebar (the panel icon, top left). In a wide panel the history
+  stays open as a column. Search, filter by type, and click an entry to replay its full transcript
+  read-only (report and file buttons still work). The trash icon removes a finished entry from the
+  history only; reports, evidence, and the audit trail stay in `.qa-harness`.
+
+### The panel at a glance
+
+* **Agent steps.** While a run is active, the Assistant tab shows each step the agent takes:
+  *reading* the requirement, *thinking* (every AI call: analysis, page choice, design, revision),
+  *browsing* pages, *waiting* for you at a gate, *generating* tests, the *AST security gate*, the
+  *dry run*, *running* tests (live `3/6 · 2 passed` progress with the pytest output attached),
+  *investigating* failures, and *building reports*. Each step shows its result and duration. Groups of
+  finished steps collapse to "Completed N steps"; click to expand.
+* **Stage track.** The bar under the run title shows where the run is: Scope, Analyze, Explore,
+  Design, Review, Dry run, Execute, Report. Retests and regressions skip the design stages.
+* **Run history.** Every execution (new suite, suite update, retest, failed-case retest, regression)
+  is its own entry in the history sidebar (the panel icon, top left). In a wide panel the history
+  stays open as a column. Search, filter by type, and click an entry to replay its full transcript
+  read-only (report and file buttons still work). The trash icon removes a finished entry from the
+  history only; reports, evidence, and the audit trail stay in `.qa-harness`.
 
 ## 3. Connect an AI provider (AI Provider tab)
 
@@ -254,3 +286,5 @@ Exit codes: `0` all passed, `3` test failures, `2` error, `1` cancelled.
 | `.qa-harness/archive/suites/` | Deleted suites and `archive-log.json` |
 | `.qa-harness/ai-usage.json` | AI calls per day (design and failure analysis), last 30 days |
 | `.qa-harness/cache/investigations.json` | Reusable failure analyses (7 days, max 500) |
+| `.qa-harness/history/` | Panel transcript of every run (messages, agent steps, cards, test output) for the history sidebar. Secret values never reach the panel, so they are never stored here |
+| `.qa-harness/history/` | Panel transcript of every run (messages, agent steps, cards, test output) for the history sidebar. Secret values never reach the panel, so they are never stored here |

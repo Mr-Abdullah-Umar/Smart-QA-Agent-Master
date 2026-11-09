@@ -9,6 +9,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { AIService, PROVIDERS, ProviderId } from "./ai/aiService";
 import { EngineClient } from "./engineClient";
+import { RunHistory, SessionKind } from "./history";
 import { IdentityService } from "./identity";
 import { RPCClient } from "./rpc/client";
 import { generateWebviewCSP } from "./security/csp";
@@ -54,6 +55,8 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private boundRpc?: RPCClient;
   private suites: SuiteSummary[] = [];
+  private readonly history = new RunHistory(() => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+  private historyTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -62,9 +65,17 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
     private readonly identity: IdentityService,
     private readonly secrets: HarnessSecretManager
   ) {
+    this.history.onDidChange(() => {
+      if (this.historyTimer) return;
+      this.historyTimer = setTimeout(() => {
+        this.historyTimer = undefined;
+        this.pushHistory();
+      }, 300);
+    });
     engine.onDidStart((rpc) => this.bindEngineEvents(rpc));
     engine.onDidExit((code) => {
       this.boundRpc = undefined;
+      this.history.end("error");
       if (code !== 0 && code !== null) {
         this.say(
           `QA engine stopped (exit code ${code}). See the "QA Harness Engine" output channel.`
@@ -88,6 +99,7 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
     const command = String(data.command || "");
     if (command === "ready") {
       await this.pushState();
+      this.pushHistory();
       await this.refreshSuites(true);
       return;
     }
@@ -210,6 +222,18 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
         case "ai.test":
           this.post({ type: "ai.testResult", ok: true, text: await this.ai.testConnection() });
           break;
+        case "history.list":
+          this.pushHistory();
+          break;
+        case "history.open": {
+          const session = this.history.open(String(data.id || ""));
+          if (!session) throw new Error("That run is no longer in the history.");
+          this.post({ type: "history.session", session, live: session.id === this.history.activeId() });
+          break;
+        }
+        case "history.delete":
+          await this.deleteHistory(String(data.id || ""));
+          break;
       }
     } catch (e) {
       const message = this.describe(e);
@@ -234,6 +258,7 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
   private async handlePrompt(text: string): Promise<void> {
     const url = text.match(URL_PATTERN)?.[0];
     if (!url) {
+      this.post({ type: "user", text });
       this.say(
         "Include the target URL to start a quick suite, or open the Suites tab and use " +
           "New Suite to enter a requirement with acceptance criteria."
@@ -258,7 +283,60 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       requirement,
       criteria: "",
       useAi: status.ready && requirement.length > 0,
+      prompt: text,
     });
+  }
+
+  /** Begin a history session for one execution, then run `start` (which calls the engine). */
+  private async beginSession(
+    kind: SessionKind,
+    title: string,
+    subtitle: string,
+    start: () => Promise<unknown>,
+    prompt?: string
+  ): Promise<void> {
+    const session = this.history.start(kind, title, subtitle);
+    this.post({
+      type: "session.start",
+      session: { ...session, events: undefined },
+    });
+    if (prompt) this.post({ type: "user", text: prompt });
+    try {
+      await start();
+    } catch (e) {
+      this.history.record({ type: "notice", level: "error", text: this.describe(e) });
+      this.history.end("error");
+      throw e;
+    }
+  }
+
+  private pushHistory(): void {
+    this.post({ type: "history", sessions: this.history.list(), activeId: this.history.activeId() });
+  }
+
+  private async deleteHistory(id: string): Promise<void> {
+    const session = this.history.list().find((s) => s.id === id);
+    if (!session) return;
+    if (session.status === "running" || session.status === "waiting") {
+      throw new Error("Cancel the run before removing it from the history.");
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Remove "${session.title}" from the run history?`,
+      {
+        modal: true,
+        detail:
+          "Only the panel transcript is removed. Reports, evidence, the audit trail, and the suite " +
+          "itself stay in .qa-harness.",
+      },
+      "Remove"
+    );
+    if (choice !== "Remove") return;
+    this.history.delete(id);
+    this.post({ type: "history.deleted", id });
+  }
+
+  public dispose(): void {
+    this.history.flush();
   }
 
   public async startSuite(data: Record<string, unknown>): Promise<void> {
@@ -276,23 +354,33 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       .map((d) => d.trim())
       .filter(Boolean);
     this.post({ type: "switchTab", tab: "assistant" });
-    this.say(
-      `Starting suite **${data.module || new URL(url).hostname}** ` +
-        (useAi ? `with ${status.providerLabel} (${status.model}).` : "using smoke design (no AI).")
+    const module = String(data.module || "") || new URL(url).hostname;
+    const exists = this.suites.some((s) => s.module.toLowerCase() === module.toLowerCase());
+    await this.beginSession(
+      exists ? "update" : "suite",
+      module,
+      `${new URL(url).hostname}${data.environment ? ` · ${data.environment}` : ""}`,
+      async () => {
+        this.say(
+          `Starting suite **${module}** ` +
+            (useAi ? `with ${status.providerLabel} (${status.model}).` : "using smoke design (no AI).")
+        );
+        await this.engine.request("run.start", {
+          module: String(data.module || ""),
+          start_url: url,
+          allowed_domains: domains,
+          environment: String(data.environment || ""),
+          requirement_text: String(data.requirement || ""),
+          acceptance_criteria: String(data.criteria || ""),
+          design_mode: useAi ? "ai" : "smoke",
+          ai_enabled: useAi,
+          dry_run: data.dryRun !== false,
+          approver: (await this.identity.current()) || "",
+          ...this.engine.browserOptions(),
+        });
+      },
+      data.prompt ? String(data.prompt) : undefined
     );
-    await this.engine.request("run.start", {
-      module: String(data.module || ""),
-      start_url: url,
-      allowed_domains: domains,
-      environment: String(data.environment || ""),
-      requirement_text: String(data.requirement || ""),
-      acceptance_criteria: String(data.criteria || ""),
-      design_mode: useAi ? "ai" : "smoke",
-      ai_enabled: useAi,
-      dry_run: data.dryRun !== false,
-      approver: (await this.identity.current()) || "",
-      ...this.engine.browserOptions(),
-    });
   }
 
   public async updateSuite(slug: string): Promise<void> {
@@ -420,17 +508,25 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       "Run Retest"
     );
     if (choice !== "Run Retest") return;
+    const approver = await this.identity.require();
+    const aiReady = (await this.ai.status()).ready;
     this.post({ type: "switchTab", tab: "assistant" });
-    await this.engine.request("suite.retest", {
-      slug: suite.slug,
-      failed_only: failedOnly,
-      environment: target.environment,
-      base_url: target.baseUrl,
-      authorized_attestation: true,
-      approver: await this.identity.require(),
-      ai_enabled: (await this.ai.status()).ready,
-      ...this.engine.browserOptions(),
-    });
+    await this.beginSession(
+      failedOnly ? "retest-failed" : "retest",
+      suite.module,
+      `${scope} · ${target.environment}`,
+      () =>
+        this.engine.request("suite.retest", {
+          slug: suite.slug,
+          failed_only: failedOnly,
+          environment: target.environment,
+          base_url: target.baseUrl,
+          authorized_attestation: true,
+          approver,
+          ai_enabled: aiReady,
+          ...this.engine.browserOptions(),
+        })
+    );
   }
 
   public async regression(tag: string): Promise<void> {
@@ -477,15 +573,23 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       "Run Regression"
     );
     if (choice !== "Run Regression") return;
+    const approver = await this.identity.require();
+    const aiReady = (await this.ai.status()).ready;
     this.post({ type: "switchTab", tab: "assistant" });
-    await this.engine.request("regression.run", {
-      tag,
-      environment: environment || undefined,
-      authorized_attestation: true,
-      approver: await this.identity.require(),
-      ai_enabled: (await this.ai.status()).ready,
-      ...this.engine.browserOptions(),
-    });
+    await this.beginSession(
+      "regression",
+      `Regression${tag ? ` · ${tag}` : ""}`,
+      `${matching.length} suite(s)${environment ? ` · ${environment}` : " · default environments"}`,
+      () =>
+        this.engine.request("regression.run", {
+          tag,
+          environment: environment || undefined,
+          authorized_attestation: true,
+          approver,
+          ai_enabled: aiReady,
+          ...this.engine.browserOptions(),
+        })
+    );
   }
 
   public async manageSecrets(slug: string): Promise<void> {
@@ -607,6 +711,9 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
     rpc.on("notify:message.stream", (params: Record<string, unknown>) => {
       this.post({ type: "message.stream", ...params });
     });
+    rpc.on("notify:activity", (params: Record<string, unknown>) => {
+      this.post({ type: "activity", ...params });
+    });
     rpc.on("notify:card.show", (params: Record<string, unknown>) => {
       this.post({ type: "card.show", ...params });
       if (params.card_type === "report_card" || params.card_type === "regression_card") {
@@ -621,6 +728,7 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private post(message: Record<string, unknown>): void {
+    if (message.type !== "notice" || message.level === "error") this.history.record(message);
     void this.view?.webview.postMessage(message);
   }
 
@@ -647,53 +755,98 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
   <title>QA Harness</title>
 </head>
 <body>
-  <div class="top-bar">
+<div class="app" id="app">
+  <aside class="history" id="history" aria-label="Run history">
+    <div class="history-head">
+      <span class="history-title"><span class="i" data-icon="history"></span>Run history</span>
+      <button class="icon-btn" id="btnHistoryClose" title="Close history"><span class="i" data-icon="x"></span></button>
+    </div>
+    <div class="history-search">
+      <span class="i" data-icon="search"></span>
+      <input id="historySearch" type="search" placeholder="Search runs" aria-label="Search runs" />
+    </div>
+    <div class="history-filters" id="historyFilters" role="tablist">
+      <button class="filter active" data-filter="all">All</button>
+      <button class="filter" data-filter="suite">Suites</button>
+      <button class="filter" data-filter="retest">Retests</button>
+      <button class="filter" data-filter="regression">Regression</button>
+    </div>
+    <div class="history-list" id="historyList"></div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <main class="main">
+    <header class="top-bar">
+      <button class="icon-btn" id="btnHistory" title="Run history"><span class="i" data-icon="panel"></span></button>
+      <div class="brand"><span class="brand-mark"><span class="i" data-icon="beaker"></span></span><span class="brand-name">QA Harness</span></div>
+      <div class="status-chips">
+        <button class="chip" id="chipAi" title="AI provider"><span class="dot"></span><span class="chip-text">AI</span></button>
+        <button class="chip" id="chipUser" title="Approver identity"><span class="i" data-icon="user"></span><span class="chip-text">Sign in</span></button>
+      </div>
+    </header>
+
     <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="assistant" role="tab">Assistant</button>
-      <button class="tab" data-tab="suites" role="tab">Suites</button>
-      <button class="tab" data-tab="ai" role="tab">AI Provider</button>
+      <button class="tab active" data-tab="assistant" role="tab"><span class="i" data-icon="spark"></span>Assistant</button>
+      <button class="tab" data-tab="suites" role="tab"><span class="i" data-icon="layers"></span>Suites</button>
+      <button class="tab" data-tab="ai" role="tab"><span class="i" data-icon="cpu"></span>AI Provider</button>
+      <span class="tab-indicator" id="tabIndicator"></span>
     </nav>
-    <div class="status-chips">
-      <span class="chip" id="chipAi" title="AI provider">AI: ...</span>
-      <button class="chip chip-btn" id="chipUser" title="Approver identity">Sign in</button>
+
+    <div class="engine-banner" id="engineBanner" hidden>
+      <span class="i" data-icon="alert"></span>
+      <span>The QA engine is not set up yet.</span>
+      <button class="btn-primary" id="btnSetup">Set Up Engine</button>
     </div>
-  </div>
 
-  <div class="engine-banner" id="engineBanner" hidden>
-    The QA engine is not set up yet.
-    <button class="btn-primary" id="btnSetup">Set Up Engine</button>
-  </div>
-
-  <section class="panel" id="panel-assistant">
-    <div class="timeline-bar">
-      <div>
+    <section class="panel" id="panel-assistant">
+      <div class="run-header" id="runHeader" data-state="idle">
+        <span class="run-dot" id="runDot"></span>
+        <div class="run-info">
+          <div class="run-title" id="runTitle">Ready</div>
+          <div class="run-desc" id="stageDesc">Awaiting instructions</div>
+        </div>
         <span class="stage-badge" id="stageBadge">READY</span>
-        <span class="stage-desc" id="stageDesc">Awaiting instructions</span>
+        <button class="btn-cancel" id="btnCancel" title="Cancel the current run"><span class="i" data-icon="stop"></span>Cancel</button>
       </div>
-      <button class="btn-cancel" id="btnCancel">Cancel</button>
-    </div>
-    <div class="chat-container" id="chatContainer">
-      <div class="message-bubble assistant">
-        Welcome to the <strong>AI QA Testing Harness</strong>.<br/>
-        &bull; <strong>Suites</strong> tab: create a suite from a requirement and acceptance
-        criteria, retest a module, or run regression across all suites.<br/>
-        &bull; Or type a message containing your application URL for a quick suite.
+      <div class="stage-track" id="stageTrack" aria-hidden="true"></div>
+      <div class="replay-banner" id="replayBanner" hidden>
+        <span class="i" data-icon="history"></span>
+        <span id="replayText">Viewing a past run (read-only)</span>
+        <button class="btn-secondary btn-sm" id="btnBackLive">Back to live</button>
       </div>
-    </div>
-    <div class="input-dock">
-      <textarea id="txtPrompt" placeholder="Paste your app URL (optionally with what to test) ..."></textarea>
-      <button class="btn-primary" id="btnSend">Send</button>
-    </div>
-  </section>
+      <div class="chat-container" id="chatContainer">
+        <div class="welcome" id="welcome">
+          <div class="welcome-orb"><span class="i" data-icon="beaker"></span></div>
+          <h2>AI QA Testing Harness</h2>
+          <p>Design suites from requirements, approve them at every gate, and follow each agent
+            step live: thinking, browsing, running, and investigating.</p>
+          <div class="quick-actions">
+            <button class="quick" data-quick="newSuite"><span class="i" data-icon="plus"></span><span><strong>New suite</strong><small>Requirement + acceptance criteria</small></span></button>
+            <button class="quick" data-quick="suites"><span class="i" data-icon="refresh"></span><span><strong>Retest a module</strong><small>Run an approved suite again</small></span></button>
+            <button class="quick" data-quick="regression"><span class="i" data-icon="layers"></span><span><strong>Regression</strong><small>Every stored suite</small></span></button>
+            <button class="quick" data-quick="history"><span class="i" data-icon="history"></span><span><strong>History</strong><small>Replay any past run</small></span></button>
+          </div>
+          <p class="hint">Or paste your application URL below for a quick suite.</p>
+        </div>
+      </div>
+      <div class="chat-container replay" id="replayContainer" hidden></div>
+      <div class="input-dock" id="inputDock">
+        <div class="composer">
+          <textarea id="txtPrompt" rows="1" placeholder="Paste your app URL, optionally with what to test ..."></textarea>
+          <button class="send-btn" id="btnSend" title="Send (Enter)"><span class="i" data-icon="send"></span></button>
+        </div>
+        <div class="composer-hint">Enter to send &middot; Shift+Enter for a new line</div>
+      </div>
+    </section>
 
-  <section class="panel" id="panel-suites" hidden>
+    <section class="panel" id="panel-suites" hidden>
     <div class="panel-scroll">
       <div class="toolbar">
-        <button class="btn-primary" id="btnNewSuite">+ New Suite</button>
-        <button class="btn-secondary" id="btnRefresh">Refresh</button>
+        <button class="btn-primary" id="btnNewSuite"><span class="i" data-icon="plus"></span>New Suite</button>
+        <button class="btn-secondary" id="btnRefresh"><span class="i" data-icon="refresh"></span>Refresh</button>
       </div>
 
-      <form class="decision-card" id="suiteForm" hidden>
+      <form class="decision-card form-card" id="suiteForm" hidden>
         <h3 id="formTitle">New test suite</h3>
         <p class="muted small" id="formNote" hidden>The AI updates the approved cases to the edited
           requirement: unchanged cases keep their IDs. You review and approve the new version.</p>
@@ -727,8 +880,8 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
         </div>
       </form>
 
-      <div class="decision-card">
-        <h3>Regression</h3>
+      <div class="decision-card" data-accent="run">
+        <h3><span class="card-icon"><span class="i" data-icon="layers"></span></span>Regression</h3>
         <p class="muted">Run every stored suite, optionally limited to one test type. You choose
           the environment when you start it.</p>
         <div class="row">
@@ -746,8 +899,8 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
 
   <section class="panel" id="panel-ai" hidden>
     <div class="panel-scroll">
-      <div class="decision-card">
-        <h3>AI provider</h3>
+      <div class="decision-card" data-accent="think">
+        <h3><span class="card-icon"><span class="i" data-icon="cpu"></span></span>AI provider</h3>
         <p class="muted" id="aiHelp"></p>
         <label class="card-label" for="aiProvider">Provider</label>
         <select id="aiProvider"></select>
@@ -785,8 +938,8 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
         <div class="ai-status" id="aiStatus"></div>
       </div>
 
-      <div class="decision-card">
-        <h3>AI cost controls</h3>
+      <div class="decision-card" data-accent="check">
+        <h3><span class="card-icon"><span class="i" data-icon="gauge"></span></span>AI cost controls</h3>
         <p class="muted small">Designing, revising, and repairing suites always uses AI (never
           limited). Limits apply only to analyzing failed tests during runs; when a limit is reached,
           failures are classified by rules instead. Pass/fail results and defect sign-off are not
@@ -809,8 +962,8 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
         <div class="ai-status" id="costUsage"></div>
       </div>
 
-      <div class="decision-card">
-        <h3>GitHub account (approver)</h3>
+      <div class="decision-card" data-accent="save">
+        <h3><span class="card-icon"><span class="i" data-icon="user"></span></span>GitHub account (approver)</h3>
         <p class="muted">Scope confirmations, test case approvals, defect sign-offs, retests, and
           regressions are recorded under this account.</p>
         <div class="row">
@@ -826,6 +979,9 @@ export class QAChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
   </section>
+  </main>
+</div>
+<div class="toast-host" id="toastHost" aria-live="polite"></div>
 
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

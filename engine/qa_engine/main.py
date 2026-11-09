@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import re
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +53,7 @@ from qa_engine.investigation.planner import (
 from qa_engine.llm.bridge_provider import ExtensionBridgeProvider
 from qa_engine.llm.provider import LLMProvider
 from qa_engine.llm.usage import AIUsageLedger, MeteredLLM, UsageCounter
+from qa_engine.orchestrator.activity import ActivityReporter
 from qa_engine.orchestrator.review import ReviewManager
 from qa_engine.orchestrator.rpc import RemoteRPCError, RPCDispatcher, StdioChannel
 from qa_engine.orchestrator.run_store import RunStore, ScopeModel
@@ -75,8 +77,9 @@ from qa_engine.security.ssrf import validate_destination_url
 
 logger = logging.getLogger(__name__)
 
-ENGINE_VERSION = "0.4.0"
+ENGINE_VERSION = "0.5.0"
 SecretResolver = Callable[[SuiteRecord, List[str]], Awaitable[Dict[str, str]]]
+PYTEST_RESULT_LINE = re.compile(r"::(test_\w+)\S*\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b")
 
 UPDATE_SUITE_COMMENTS = (
     "The requirement and/or acceptance criteria of this existing suite were updated. Keep "
@@ -92,6 +95,17 @@ def _stamp() -> str:
 def _origin(url: str) -> str:
     parts = urlparse(url)
     return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def _short_url(url: str) -> str:
+    parts = urlparse(url)
+    path = parts.path.rstrip("/")
+    return f"{parts.netloc}{_clip(path, 48)}" if path else parts.netloc
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
@@ -146,6 +160,7 @@ class QAEngineServer:
         self.dispatcher = RPCDispatcher()
         self.llm: LLMProvider = llm or ExtensionBridgeProvider(self.channel)
         self.secret_resolver = secret_resolver or self._resolve_secrets_via_extension
+        self.activity = ActivityReporter(self._notify)
         self.session: Optional[DesignSession] = None
         self.run_store: Optional[RunStore] = None
         self.state_machine: Optional[OrchestrationStateMachine] = None
@@ -241,6 +256,20 @@ class QAEngineServer:
                 Stage.CANCELLED,
             ):
                 await self.state_machine.mark_error(str(exc))
+
+    async def _load_secrets(self, record: SuiteRecord, names: List[str]) -> Dict[str, str]:
+        if not names:
+            return {}
+        async with self.activity.step(
+            "read", "Loading suite secrets", ", ".join(names) + " from the OS keychain"
+        ) as step:
+            values = await self.secret_resolver(record, names)
+            missing = [n for n in names if n not in values]
+            step.done(
+                f"{len(values)} of {len(names)} loaded (values stay masked)",
+                status="failed" if missing else "done",
+            )
+        return values
 
     async def _resolve_secrets_via_extension(
         self, record: SuiteRecord, names: List[str]
@@ -380,13 +409,20 @@ class QAEngineServer:
         store, sm = session.store, session.sm
 
         # Stage 1: intake & redaction
-        requirement, req_report = RedactionEngine.redact(session.requirement)
-        criteria_text, ac_report = RedactionEngine.redact(session.criteria_text)
-        session.requirement = requirement
-        session.criteria = parse_acceptance_criteria(criteria_text)
-        store.write_atomic("requirement.md", self._requirement_md(session))
-        store.write_json_atomic("criteria.json", session.criteria)
-        redacted = req_report.total_redacted + ac_report.total_redacted
+        async with self.activity.step(
+            "read", "Reading requirement", "Requirement and acceptance criteria"
+        ) as step:
+            requirement, req_report = RedactionEngine.redact(session.requirement)
+            criteria_text, ac_report = RedactionEngine.redact(session.criteria_text)
+            session.requirement = requirement
+            session.criteria = parse_acceptance_criteria(criteria_text)
+            store.write_atomic("requirement.md", self._requirement_md(session))
+            store.write_json_atomic("criteria.json", session.criteria)
+            redacted = req_report.total_redacted + ac_report.total_redacted
+            step.done(
+                f"{len(session.criteria)} acceptance criteria · {redacted} sensitive token(s) "
+                "redacted"
+            )
         await self._say(
             f"Module **{session.module}**: {len(session.criteria)} acceptance criteria received"
             f" ({redacted} sensitive token(s) redacted)."
@@ -403,7 +439,14 @@ class QAEngineServer:
             )
             if session.requirement or session.criteria:
                 await self._say("Asking the AI provider to analyze the requirement ...")
-                analysis = await session.designer.analyze(session.requirement, session.criteria)
+                async with self.activity.step(
+                    "think", "Analyzing requirement", "Looking for gaps that block test design"
+                ) as step:
+                    analysis = await session.designer.analyze(session.requirement, session.criteria)
+                    questions = len(analysis.clarification_questions)
+                    step.done(
+                        f"{questions} clarification question(s)" if questions else "No questions"
+                    )
                 store.write_json_atomic("analysis.json", analysis.model_dump())
                 await self._say(f"Analysis: {analysis.summary}")
                 if analysis.clarification_questions:
@@ -430,16 +473,25 @@ class QAEngineServer:
                 f"\nClarification - {c['question']} Answer: {c['answer']}"
                 for c in session.clarifications
             )
-            result = await session.designer.revise(
-                base,
-                UPDATE_SUITE_COMMENTS + answers,
-                session.requirement,
-                session.criteria,
-                session.snapshots,
-            )
-            collection = build_collection(
-                result, session.module, req_ref, existing_ids={tc.tc_id for tc in base.testcases}
-            )
+            async with self.activity.step(
+                "think",
+                "Updating approved suite",
+                f"Revising {len(base.testcases)} approved case(s) to the new requirement",
+            ) as step:
+                result = await session.designer.revise(
+                    base,
+                    UPDATE_SUITE_COMMENTS + answers,
+                    session.requirement,
+                    session.criteria,
+                    session.snapshots,
+                )
+                collection = build_collection(
+                    result,
+                    session.module,
+                    req_ref,
+                    existing_ids={tc.tc_id for tc in base.testcases},
+                )
+                step.done(f"{len(collection.testcases)} case(s) drafted")
             changes = TestCaseDiffEngine.compute_diff(base, collection).generate_summary()
             await self._present_review(
                 session,
@@ -450,14 +502,27 @@ class QAEngineServer:
             return
         elif session.designer:
             await self._say("AI is designing test cases from the requirement and pages ...")
-            result = await session.designer.design(
-                session.requirement, session.criteria, session.clarifications, session.snapshots
-            )
-            collection = build_collection(result, session.module, req_ref)
+            async with self.activity.step(
+                "think",
+                "Designing test cases",
+                f"From {len(session.criteria)} criteria and {len(session.snapshots)} page(s)",
+            ) as step:
+                result = await session.designer.design(
+                    session.requirement,
+                    session.criteria,
+                    session.clarifications,
+                    session.snapshots,
+                )
+                collection = build_collection(result, session.module, req_ref)
+                step.done(f"{len(collection.testcases)} case(s) drafted")
         else:
-            collection = design_smoke_testcases(
-                session.snapshots[0], module=session.module, requirement_ref=req_ref
-            )
+            async with self.activity.step(
+                "write", "Drafting smoke suite", "From the start page structure"
+            ) as step:
+                collection = design_smoke_testcases(
+                    session.snapshots[0], module=session.module, requirement_ref=req_ref
+                )
+                step.done(f"{len(collection.testcases)} case(s) drafted")
         await self._present_review(session, collection, diff_summary=None, revised=False)
 
     @staticmethod
@@ -476,7 +541,12 @@ class QAEngineServer:
             session.store.run_id,
             {"summary": analysis.get("summary", ""), "questions": questions},
         )
-        answers: Dict[str, str] = await session.pending_questions
+        async with self.activity.step(
+            "wait", "Waiting for your answers", f"{len(questions)} question(s)"
+        ) as step:
+            answers: Dict[str, str] = await session.pending_questions
+            answered = len([v for v in answers.values() if v.strip()])
+            step.done(f"{answered} of {len(questions)} answered")
         session.pending_questions = None
         session.clarifications = [
             {
@@ -520,24 +590,38 @@ class QAEngineServer:
         snapshots: List[SnapshotResult] = []
         a11y_count = 0
         try:
-            await browser.initialize()
-            first = await browser.navigate(scope.start_url)
-            snapshots.append(first)
-            await browser.screenshot("explore_01")
-            a11y_count = len(await ExtendedChecksCollector.collect_accessibility(browser._page))
+            async with self.activity.step(
+                "browse", f"Opening {_short_url(scope.start_url)}", f"{label}, guarded browser"
+            ) as step:
+                await browser.initialize()
+                first = await browser.navigate(scope.start_url)
+                snapshots.append(first)
+                await browser.screenshot("explore_01")
+                a11y_count = len(await ExtendedChecksCollector.collect_accessibility(browser._page))
+                step.done(
+                    f"'{first.title}' · {first.total_interactive_elements} interactive elements"
+                )
             if session.designer:
                 links = await browser.list_links()
                 max_extra = max(0, min(4, scope.max_pages - 1))
-                urls = await session.designer.choose_pages(
-                    session.requirement, session.criteria, first, links, max_pages=max_extra
-                )
+                async with self.activity.step(
+                    "think", "Choosing pages to explore", f"{len(links)} link(s) on the start page"
+                ) as step:
+                    urls = await session.designer.choose_pages(
+                        session.requirement, session.criteria, first, links, max_pages=max_extra
+                    )
+                    step.done(f"{len(urls)} more page(s) relevant" if urls else "Start page only")
                 for idx, url in enumerate(urls, start=2):
-                    try:
-                        snapshots.append(await browser.navigate(url))
-                        await browser.screenshot(f"explore_{idx:02d}")
-                        await self._say(f"Explored {url}")
-                    except Exception as exc:  # noqa: BLE001
-                        await self._say(f"Skipped {url}: {exc}")
+                    async with self.activity.step("browse", f"Reading {_short_url(url)}") as step:
+                        try:
+                            page = await browser.navigate(url)
+                            snapshots.append(page)
+                            await browser.screenshot(f"explore_{idx:02d}")
+                            step.done(f"{page.total_interactive_elements} interactive elements")
+                            await self._say(f"Explored {url}")
+                        except Exception as exc:  # noqa: BLE001
+                            step.done(f"Skipped: {exc}", status="failed")
+                            await self._say(f"Skipped {url}: {exc}")
             if headed:
                 await asyncio.sleep(1)
         finally:
@@ -639,16 +723,18 @@ class QAEngineServer:
         assert session.designer and session.collection
         await self._say("Revising test cases with the AI provider ...")
         current = session.collection
-        result = await session.designer.revise(
-            current, comments, session.requirement, session.criteria, session.snapshots
-        )
-        revised = build_collection(
-            result,
-            session.module,
-            f"REQ-{module_code(session.module)}",
-            version=current.version + 1,
-            existing_ids={tc.tc_id for tc in current.testcases},
-        )
+        async with self.activity.step("think", "Revising test cases", _clip(comments, 140)) as step:
+            result = await session.designer.revise(
+                current, comments, session.requirement, session.criteria, session.snapshots
+            )
+            revised = build_collection(
+                result,
+                session.module,
+                f"REQ-{module_code(session.module)}",
+                version=current.version + 1,
+                existing_ids={tc.tc_id for tc in current.testcases},
+            )
+            step.done(f"v{revised.version} · {len(revised.testcases)} case(s)")
         await self._present_review(session, revised, diff_summary=None, revised=True)
 
     async def handle_testcases_approve(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -673,13 +759,23 @@ class QAEngineServer:
         scope = store.load_scope()
 
         scripts_dir = store.run_dir / "scripts"
-        paths = ScriptGenerator.write_scripts(scripts_dir, collection.testcases, session.module)
-        result = ScriptValidator.validate_script(
-            paths["test"].read_text(encoding="utf-8"),
-            approved_tc_ids={tc.tc_id for tc in collection.testcases},
-        )
-        if not result.is_valid:
-            raise RuntimeError(f"AST security gate rejected generated tests: {result.errors}")
+        async with self.activity.step(
+            "write",
+            "Generating Playwright tests",
+            f"{len(collection.testcases)} approved case(s)",
+        ) as step:
+            paths = ScriptGenerator.write_scripts(scripts_dir, collection.testcases, session.module)
+            step.done(f"{len(collection.testcases)} pytest test(s) written")
+        async with self.activity.step(
+            "check", "AST security gate", "Only approved actions and test IDs allowed"
+        ) as step:
+            result = ScriptValidator.validate_script(
+                paths["test"].read_text(encoding="utf-8"),
+                approved_tc_ids={tc.tc_id for tc in collection.testcases},
+            )
+            if not result.is_valid:
+                raise RuntimeError(f"AST security gate rejected generated tests: {result.errors}")
+            step.done("Passed")
 
         suites = SuiteStore(store.workspace_root)
         if suites.exists(session.slug):
@@ -697,22 +793,26 @@ class QAEngineServer:
             )
         record.requirement_text = session.requirement
         needed = required_secrets(collection)
-        secrets = await self.secret_resolver(record, needed) if needed else {}
+        secrets = await self._load_secrets(record, needed)
 
         if session.options.get("dry_run", True):
             proceed = await self._dry_run_gate(session, collection, scope, secrets, approver)
             if not proceed:
                 return
 
-        approval = suites.save_version(
-            record,
-            collection,
-            scripts_dir,
-            approver,
-            store.read_text("requirement.md"),
-            session.criteria,
-            needed,
-        )
+        async with self.activity.step(
+            "save", f"Saving suite {record.module}", "Hash-bound approved version"
+        ) as step:
+            approval = suites.save_version(
+                record,
+                collection,
+                scripts_dir,
+                approver,
+                store.read_text("requirement.md"),
+                session.criteria,
+                needed,
+            )
+            step.done(f"v{approval.version} saved to the library")
         await self._say(
             f"Generated {len(collection.testcases)} pytest test(s), AST security gate passed. "
             f"Saved suite **{record.module}** v{approval.version} to the library."
@@ -746,22 +846,35 @@ class QAEngineServer:
             f"Dry run: checking {len(collection.testcases)} case(s) step by step",
         )
 
-        async def on_case(result: DryRunCaseResult) -> None:
-            mark = {"ok": "ok", "issue": "PROBLEM", "blocked": "blocked (missing secret)"}
-            note = f" - step {result.issue.step}: {result.issue.detail}" if result.issue else ""
-            await self._log(f"{result.tc_id}: {mark[result.status]}{note}")
+        total = len(collection.testcases)
+        async with self.activity.step(
+            "check", "Dry run", f"Replaying every step of {total} case(s) once"
+        ) as step:
+            checked = 0
 
-        report, failure_pages = await run_dry_run(
-            collection,
-            scope.start_url,
-            scope.allowed_domains,
-            secrets,
-            headless=not headed,
-            channel=self._browser_channel(options),
-            slowmo_ms=options["slowmo_ms"] if headed else 0,
-            evidence_dir=session.store.run_dir / "evidence" / "dry_run",
-            on_case=on_case,
-        )
+            async def on_case(result: DryRunCaseResult) -> None:
+                nonlocal checked
+                checked += 1
+                mark = {"ok": "ok", "issue": "PROBLEM", "blocked": "blocked (missing secret)"}
+                note = f" - step {result.issue.step}: {result.issue.detail}" if result.issue else ""
+                await self._log(f"{result.tc_id}: {mark[result.status]}{note}")
+                await step.update(f"{checked}/{total} · {result.tc_id} {mark[result.status]}")
+
+            report, failure_pages = await run_dry_run(
+                collection,
+                scope.start_url,
+                scope.allowed_domains,
+                secrets,
+                headless=not headed,
+                channel=self._browser_channel(options),
+                slowmo_ms=options["slowmo_ms"] if headed else 0,
+                evidence_dir=session.store.run_dir / "evidence" / "dry_run",
+                on_case=on_case,
+            )
+            if report.issues:
+                step.done(f"{len(report.issues)} problem(s) found", status="failed")
+            else:
+                step.done(f"All {len(report.cases)} case(s) executable")
         await self._end_log()
         session.store.write_json_atomic(
             "dry_run.json", {**report.model_dump(), "issues": len(report.issues)}
@@ -791,7 +904,11 @@ class QAEngineServer:
                 "can_fix": session.designer is not None,
             },
         )
-        decision: str = await session.pending_dry_run
+        async with self.activity.step(
+            "wait", "Waiting for your dry-run decision", "Fix with AI, run anyway, or cancel"
+        ) as step:
+            decision: str = await session.pending_dry_run
+            step.done({"fix": "Fix with AI", "run": "Run anyway", "cancel": "Cancel"}[decision])
         session.pending_dry_run = None
         session.store.audit.log_event(
             stage=Stage.STAGE_7_DRY_RUN.value,
@@ -846,54 +963,88 @@ class QAEngineServer:
     ) -> SuiteRunSummary:
         scope = store.load_scope()
         selected = [
-            tc for tc in collection.testcases if not select_tc_ids or tc.tc_id in select_tc_ids
+            tc
+            for tc in collection.testcases
+            if (not select_tc_ids or tc.tc_id in select_tc_ids)
+            and (not marker or marker in tc.test_types)
         ]
         if secrets is None:
-            secrets = {}
-            if record.required_secrets:
-                secrets = await self.secret_resolver(record, record.required_secrets)
+            secrets = await self._load_secrets(record, record.required_secrets)
 
         headed = options["headed"]
         channel = self._browser_channel(options)
+        browser_label = (
+            f"{'visible' if headed else 'headless'} {'Google Chrome' if channel else 'Chromium'}"
+        )
         await sm.advance_to(
             Stage.STAGE_8_EXECUTION,
-            f"Running {len(selected)} test(s) of {record.module} in "
-            f"{'visible' if headed else 'headless'} {'Google Chrome' if channel else 'Chromium'}",
+            f"Running {len(selected)} test(s) of {record.module} in {browser_label}",
         )
         loop = asyncio.get_running_loop()
         pending: List[Future] = []
+        tc_by_function = {test_function_name(tc.tc_id): tc.tc_id for tc in selected}
+        finished: Dict[str, str] = {}
 
-        def on_output(line: str) -> None:
-            pending.append(asyncio.run_coroutine_threadsafe(self._log(line), loop))
+        async with self.activity.step(
+            "run",
+            f"Running {len(selected)} test(s)",
+            f"{record.module} · {scope.environment} · {browser_label}",
+        ) as step:
 
-        runner = PytestRunner(store)
-        summary: ExecutionSummary = await loop.run_in_executor(
-            None,
-            functools.partial(
-                runner.run_tests,
-                test_dir=tests_dir,
-                base_url=scope.start_url,
-                retries=1,
-                timeout_seconds=max(600, 120 * len(selected)),
-                headed=headed,
-                browser_channel=channel,
-                slowmo_ms=options["slowmo_ms"] if headed else 0,
-                on_output=on_output,
-                allowed_domains=scope.allowed_domains,
-                secrets=secrets,
-                select_tests=[test_function_name(t) for t in select_tc_ids or []] or None,
-                marker=marker,
-                origin_map=origin_map,
-            ),
-        )
-        if pending:
-            await asyncio.gather(*(asyncio.wrap_future(f) for f in pending))
+            def on_output(line: str) -> None:
+                pending.append(asyncio.run_coroutine_threadsafe(self._log(line), loop))
+                match = PYTEST_RESULT_LINE.search(line)
+                if not match:
+                    return
+                tc_id = tc_by_function.get(match.group(1), match.group(1))
+                finished[tc_id] = match.group(2).lower()
+                passed = sum(1 for s in finished.values() if s == "passed")
+                progress = (
+                    f"{len(finished)}/{len(selected)} · {passed} passed · "
+                    f"{tc_id} {match.group(2).lower()}"
+                )
+                pending.append(asyncio.run_coroutine_threadsafe(step.update(progress), loop))
+
+            runner = PytestRunner(store)
+            summary: ExecutionSummary = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    runner.run_tests,
+                    test_dir=tests_dir,
+                    base_url=scope.start_url,
+                    retries=1,
+                    timeout_seconds=max(600, 120 * len(selected)),
+                    headed=headed,
+                    browser_channel=channel,
+                    slowmo_ms=options["slowmo_ms"] if headed else 0,
+                    on_output=on_output,
+                    allowed_domains=scope.allowed_domains,
+                    secrets=secrets,
+                    select_tests=[test_function_name(t) for t in select_tc_ids or []] or None,
+                    marker=marker,
+                    origin_map=origin_map,
+                ),
+            )
+            if pending:
+                await asyncio.gather(*(asyncio.wrap_future(f) for f in pending))
+            not_passed = summary.failed + summary.blocked
+            step.done(
+                f"{summary.passed} passed · {summary.failed} failed"
+                + (f" · {summary.flaky} flaky" if summary.flaky else "")
+                + (f" · {summary.blocked} blocked" if summary.blocked else "")
+                + f" in {round(summary.duration_seconds, 1)}s",
+                status="failed" if not_passed else "done",
+            )
         await self._end_log()
 
         await sm.advance_to(Stage.STAGE_9_INVESTIGATION, "Indexing evidence and investigating")
-        evidence_index = EvidenceIndex()
-        evidence_index.scan_run_directory(store.run_dir)
-        evidence_index.save(store.run_dir / "evidence" / "evidence_index.json")
+        async with self.activity.step(
+            "read", "Indexing evidence", "Screenshots, traces, and logs"
+        ) as step:
+            evidence_index = EvidenceIndex()
+            evidence_index.scan_run_directory(store.run_dir)
+            evidence_index.save(store.run_dir / "evidence" / "evidence_index.json")
+            step.done(f"{len(evidence_index.items)} artifact(s) indexed")
         ledger = AIUsageLedger(str(store.workspace_root))
         usage = UsageCounter()
         investigation_llm = (
@@ -908,19 +1059,37 @@ class QAEngineServer:
             daily_ai_limit=options["ai_daily_investigation_limit"],
             reuse_cached=options["ai_reuse_analyses"],
         )
-        investigations, investigation_stats = await investigate_failures(
-            summary.outcomes,
-            classifier,
-            policy,
-            ledger,
-            InvestigationCache(str(store.workspace_root), policy.cache_ttl_days),
-            slug=record.slug,
-            suite_hash=sm.state.approved_testcases_hash or "",
-            origin=_origin(scope.start_url),
-            run_id=store.run_id,
-            priorities={tc.tc_id: tc.priority.value for tc in collection.testcases},
-            ac_refs={tc.tc_id: tc.ac_ref for tc in collection.testcases},
-        )
+        failures = [o for o in summary.outcomes if o.status not in ("passed", "skipped")]
+        async with self.activity.step(
+            "investigate",
+            f"Investigating {len(failures)} failure(s)" if failures else "Checking outcomes",
+            "Rules first, then reuse, cache, and AI within your limits" if failures else "",
+        ) as step:
+            investigations, investigation_stats = await investigate_failures(
+                summary.outcomes,
+                classifier,
+                policy,
+                ledger,
+                InvestigationCache(str(store.workspace_root), policy.cache_ttl_days),
+                slug=record.slug,
+                suite_hash=sm.state.approved_testcases_hash or "",
+                origin=_origin(scope.start_url),
+                run_id=store.run_id,
+                priorities={tc.tc_id: tc.priority.value for tc in collection.testcases},
+                ac_refs={tc.tc_id: tc.ac_ref for tc in collection.testcases},
+            )
+            parts = [
+                f"{investigation_stats.get(key, 0)} {label}"
+                for key, label in (
+                    ("ai", "by AI"),
+                    ("reused", "reused"),
+                    ("cached", "cached"),
+                    ("rules", "by rules"),
+                    ("limited", "limit reached"),
+                )
+                if investigation_stats.get(key)
+            ]
+            step.done(" · ".join(parts) if parts else "Nothing to investigate")
         ai_usage = {**usage.to_dict(), "investigations": investigation_stats}
         store.write_json_atomic("ai_usage.json", ai_usage)
         if investigation_stats["limited"]:
@@ -930,22 +1099,26 @@ class QAEngineServer:
             )
 
         await sm.advance_to(Stage.STAGE_10_SIGN_OFF, "Building reports")
-        builder = ReportBuilder()
-        payload = builder.prepare_payload(
-            run_id=store.run_id,
-            target_url=scope.start_url,
-            summary=summary,
-            test_collection=collection,
-            investigations=investigations,
-            gate_1_hash=sm.state.approved_testcases_hash,
-            audit_count=store.audit.current_entry_id,
-            audit_hash_head=store.audit.last_hash,
-            module=record.module,
-            run_type=run_type,
-            environment=scope.environment,
-            triggered_by=actor,
-        )
-        reports = builder.write_all_reports(payload, store)
+        async with self.activity.step(
+            "report", "Building reports", "HTML, Markdown, JSON, and JUnit"
+        ) as step:
+            builder = ReportBuilder()
+            payload = builder.prepare_payload(
+                run_id=store.run_id,
+                target_url=scope.start_url,
+                summary=summary,
+                test_collection=collection,
+                investigations=investigations,
+                gate_1_hash=sm.state.approved_testcases_hash,
+                audit_count=store.audit.current_entry_id,
+                audit_hash_head=store.audit.last_hash,
+                module=record.module,
+                run_type=run_type,
+                environment=scope.environment,
+                triggered_by=actor,
+            )
+            reports = builder.write_all_reports(payload, store)
+            step.done(f"{len(reports)} report file(s) written")
 
         statuses = {o.tc_id: o.status for o in summary.outcomes}
         run_summary = SuiteRunSummary(
@@ -1145,13 +1318,17 @@ class QAEngineServer:
         scope: ScopeModel,
         origin_map: Dict[str, str],
     ) -> None:
-        store, sm, collection, tests_dir, approval = self._prepare_stored_run(
-            workspace_root, record, run_id
-        )
-        self.run_store, self.state_machine = store, sm
-        await sm.restore_approved_suite(
-            scope, approval.version, approval.sha256_hash, approval.approver, actor
-        )
+        async with self.activity.step(
+            "check", "Verifying approved suite", f"{record.module}: hash and scripts"
+        ) as step:
+            store, sm, collection, tests_dir, approval = self._prepare_stored_run(
+                workspace_root, record, run_id
+            )
+            self.run_store, self.state_machine = store, sm
+            await sm.restore_approved_suite(
+                scope, approval.version, approval.sha256_hash, approval.approver, actor
+            )
+            step.done(f"v{approval.version} intact · approved by {approval.approver}")
         scope_note = f"{len(select)} failed case(s)" if select else "all cases"
         await self._say(
             f"Retesting **{record.module}** v{approval.version}: {scope_note} on "
@@ -1233,13 +1410,19 @@ class QAEngineServer:
             previous = suites.latest_results(record.slug)
             try:
                 scope, origin_map = self._resolve_target(record, environment)
-                store, sm, collection, tests_dir, approval = self._prepare_stored_run(
-                    workspace_root, record, f"{regression_id}-{record.slug}"
-                )
-                self.run_store, self.state_machine = store, sm
-                await sm.restore_approved_suite(
-                    scope, approval.version, approval.sha256_hash, approval.approver, actor
-                )
+                async with self.activity.step(
+                    "check",
+                    f"Verifying {record.module}",
+                    f"Suite {index} of {len(records)}: hash and scripts",
+                ) as step:
+                    store, sm, collection, tests_dir, approval = self._prepare_stored_run(
+                        workspace_root, record, f"{regression_id}-{record.slug}"
+                    )
+                    self.run_store, self.state_machine = store, sm
+                    await sm.restore_approved_suite(
+                        scope, approval.version, approval.sha256_hash, approval.approver, actor
+                    )
+                    step.done(f"v{approval.version} intact")
                 summary = await self._execute_suite(
                     store,
                     sm,

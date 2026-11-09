@@ -126,6 +126,18 @@ async function main() {
     if (idx >= 0) waiters.splice(idx, 1)[0].resolve(p.data);
   });
   rpc.on("notify:stage.update", (p) => console.log(`  stage: ${p.stage} - ${p.description}`));
+  const activity = { started: new Map(), ended: new Map(), kinds: new Set(), updates: 0 };
+  rpc.on("notify:activity", (p) => {
+    if (p.phase === "start") {
+      activity.started.set(p.id, p);
+      activity.kinds.add(p.kind);
+    } else if (p.phase === "end") {
+      activity.ended.set(p.id, p);
+      console.log(`  step: ${activity.started.get(p.id)?.title} -> ${p.status} (${p.detail || ""})`);
+    } else {
+      activity.updates += 1;
+    }
+  });
   rpc.on("notify:message.stream", (p) => {
     if (p.style !== "log" && p.chunk) console.log(`  say: ${p.chunk}`);
     if (/Run failed/.test(p.chunk || "")) waiters.splice(0).forEach((w) => w.reject(new Error(p.chunk)));
@@ -328,6 +340,13 @@ async function main() {
       "design calls are tagged as design": purposes.design === llmCalls - purposes.investigation,
       "delete archived the suite": deleted.status === "archived" && afterDelete.suites.length === 0,
       "AI used for analysis, design, revision and repair": llmCalls >= 5,
+      "every agent step that started also ended":
+        activity.started.size > 0 && [...activity.started.keys()].every((id) => activity.ended.has(id)),
+      "steps cover read, think, browse, write, check, save, run, investigate, report":
+        ["read", "think", "browse", "write", "check", "save", "run", "investigate", "report"].every((k) =>
+          activity.kinds.has(k)
+        ),
+      "dry run and test execution streamed live progress": activity.updates >= 3,
     };
     for (const [name, passed] of Object.entries(checks)) {
       console.log(`  [${passed ? "ok" : "FAIL"}] ${name}`);

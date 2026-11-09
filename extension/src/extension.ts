@@ -22,7 +22,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(QAChatViewProvider.viewType, panel, {
       webviewOptions: { retainContextWhenHidden: true },
-    })
+    }),
+    { dispose: () => panel.dispose() }
   );
 
   engine.handleRequest("llm.chat", async (params) => {
