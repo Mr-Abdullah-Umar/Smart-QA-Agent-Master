@@ -1,4 +1,4 @@
-# AI QA Testing Harness - User Guide (v0.5.0)
+# AI QA Testing Harness - User Guide (v0.5.1)
 
 Write a requirement and its acceptance criteria, and the harness designs a **test suite** for that
 module, lets you review and approve it, generates Playwright tests, runs them in a real browser, and
@@ -20,7 +20,7 @@ and AI model comes from you at run time.
 
 1. Install the extension package:
    ```bash
-   code --install-extension extension/ai-qa-testing-harness-0.5.0.vsix
+   code --install-extension extension/ai-qa-testing-harness-0.5.1.vsix
    ```
 2. Open the folder you want to keep test suites in (VS Code must trust the folder).
 3. Click the **QA Harness** beaker in the Activity Bar.

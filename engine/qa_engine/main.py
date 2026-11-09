@@ -77,7 +77,7 @@ from qa_engine.security.ssrf import validate_destination_url
 
 logger = logging.getLogger(__name__)
 
-ENGINE_VERSION = "0.5.0"
+ENGINE_VERSION = "0.5.1"
 SecretResolver = Callable[[SuiteRecord, List[str]], Awaitable[Dict[str, str]]]
 PYTEST_RESULT_LINE = re.compile(r"::(test_\w+)\S*\s+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b")
 
@@ -484,6 +484,7 @@ class QAEngineServer:
                     session.requirement,
                     session.criteria,
                     session.snapshots,
+                    progress=step.update,
                 )
                 collection = build_collection(
                     result,
@@ -512,6 +513,7 @@ class QAEngineServer:
                     session.criteria,
                     session.clarifications,
                     session.snapshots,
+                    progress=step.update,
                 )
                 collection = build_collection(result, session.module, req_ref)
                 step.done(f"{len(collection.testcases)} case(s) drafted")
@@ -725,7 +727,12 @@ class QAEngineServer:
         current = session.collection
         async with self.activity.step("think", "Revising test cases", _clip(comments, 140)) as step:
             result = await session.designer.revise(
-                current, comments, session.requirement, session.criteria, session.snapshots
+                current,
+                comments,
+                session.requirement,
+                session.criteria,
+                session.snapshots,
+                progress=step.update,
             )
             revised = build_collection(
                 result,

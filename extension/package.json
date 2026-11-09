@@ -2,7 +2,7 @@
   "name": "ai-qa-testing-harness",
   "displayName": "AI QA Testing Harness",
   "description": "Requirement-driven test suites, retesting, and regression with Playwright, GitHub Copilot, or your own AI provider",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "qa-engineering",
   "license": "UNLICENSED",
   "engines": {

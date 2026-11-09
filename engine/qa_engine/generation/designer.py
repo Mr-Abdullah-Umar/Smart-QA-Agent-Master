@@ -7,7 +7,7 @@ acceptance criterion. Requirement text and page content are passed as untrusted 
 
 import json
 import re
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Set
 from urllib.parse import urljoin
 
 from pydantic import BaseModel, Field
@@ -33,6 +33,10 @@ from qa_engine.security.ssrf import validate_destination_url
 
 MAX_SNAPSHOT_CHARS = 9000
 MAX_TOTAL_SNAPSHOT_CHARS = 30000
+# Criteria designed per model call; keeps each reply well under provider output limits.
+DESIGN_BATCH_SIZE = 5
+
+Progress = Optional[Callable[[str], Awaitable[None]]]
 _AC_LINE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)]|AC[-\s]?\d+[:.)-]?)\s*", re.IGNORECASE)
 
 
@@ -90,8 +94,23 @@ OUTPUT RULES FOR THIS HARNESS:
 - `test_types` is a subset of {list(TEST_TYPES)}. Mark the most critical happy path cases
   "smoke" and "sanity"; mark all cases "regression".
 - P1 cases need a one-line `priority_rationale`.
-- Prefer 4-15 focused cases. Steps are plain user language (no selectors or code).
+- Prefer 1-2 focused cases per criterion. Steps are plain user language (no selectors or code).
 """
+
+
+def _batches(criteria: List[Dict[str, str]]) -> List[List[Dict[str, str]]]:
+    size = DESIGN_BATCH_SIZE
+    return [criteria[i : i + size] for i in range(0, len(criteria), size)] or [[]]
+
+
+def _batch_note(batch: List[Dict[str, str]], index: int, total: int) -> str:
+    if total == 1:
+        return ""
+    ids = ", ".join(c["id"] for c in batch)
+    return (
+        f"\nTHIS IS BATCH {index} OF {total}: design cases ONLY for {ids}. The other criteria "
+        "are designed in separate requests, so do not cover them here.\n"
+    )
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -211,25 +230,9 @@ class AITestDesigner:
             problems.append(f"No test case covers: {', '.join(missing)}")
         return problems
 
-    async def design(
-        self,
-        requirement: str,
-        criteria: List[Dict[str, str]],
-        clarifications: List[Dict[str, str]],
-        snapshots: Sequence[SnapshotResult],
+    async def _design_call(
+        self, prompt: str, batch: List[Dict[str, str]]
     ) -> TestDesignResult:
-        answers = "\n".join(f"- Q: {c['question']}\n  A: {c['answer']}" for c in clarifications)
-        prompt = (
-            f"Design test cases for module '{self.module}'. Start URL: {self.start_url}\n"
-            f"Allowed domains: {', '.join(self.allowed_domains)}\n\n"
-            "--- BEGIN UNTRUSTED REQUIREMENT DATA ---\n"
-            f"{requirement}\n\nAcceptance criteria:\n{_criteria_block(criteria)}\n"
-            f"\nClarifications from the QA engineer:\n{answers or 'None.'}\n"
-            "--- END UNTRUSTED REQUIREMENT DATA ---\n\n"
-            "--- BEGIN UNTRUSTED PAGE SNAPSHOTS (ARIA trees) ---\n"
-            f"{_snapshots_block(snapshots)}\n--- END UNTRUSTED PAGE SNAPSHOTS ---\n"
-            f"{DESIGN_RULES}\n" + schema_instructions(TestDesignResult)
-        )
         return await chat_structured(
             self.llm,
             [
@@ -237,8 +240,45 @@ class AITestDesigner:
                 {"role": "user", "content": prompt},
             ],
             TestDesignResult,
-            extra_check=lambda r: self._check_design(r, criteria),
+            extra_check=lambda r: self._check_design(r, batch),
         )
+
+    @staticmethod
+    async def _announce(progress: Progress, batch: List[Dict[str, str]], index: int, total: int):
+        if progress and total > 1:
+            await progress(f"Batch {index} of {total}: {batch[0]['id']} to {batch[-1]['id']}")
+
+    async def design(
+        self,
+        requirement: str,
+        criteria: List[Dict[str, str]],
+        clarifications: List[Dict[str, str]],
+        snapshots: Sequence[SnapshotResult],
+        progress: Progress = None,
+    ) -> TestDesignResult:
+        answers = "\n".join(f"- Q: {c['question']}\n  A: {c['answer']}" for c in clarifications)
+        batches = _batches(criteria)
+        cases: List[DesignedCase] = []
+        notes: List[str] = []
+        for index, batch in enumerate(batches, start=1):
+            await self._announce(progress, batch, index, len(batches))
+            prompt = (
+                f"Design test cases for module '{self.module}'. Start URL: {self.start_url}\n"
+                f"Allowed domains: {', '.join(self.allowed_domains)}\n\n"
+                "--- BEGIN UNTRUSTED REQUIREMENT DATA ---\n"
+                f"{requirement}\n\nAcceptance criteria:\n{_criteria_block(criteria)}\n"
+                f"\nClarifications from the QA engineer:\n{answers or 'None.'}\n"
+                "--- END UNTRUSTED REQUIREMENT DATA ---\n\n"
+                "--- BEGIN UNTRUSTED PAGE SNAPSHOTS (ARIA trees) ---\n"
+                f"{_snapshots_block(snapshots)}\n--- END UNTRUSTED PAGE SNAPSHOTS ---\n"
+                f"{_batch_note(batch, index, len(batches))}"
+                f"{DESIGN_RULES}\n" + schema_instructions(TestDesignResult)
+            )
+            result = await self._design_call(prompt, batch)
+            cases.extend(result.testcases)
+            if result.notes:
+                notes.append(result.notes)
+        return TestDesignResult(testcases=cases, notes="\n".join(notes) or None)
 
     async def revise(
         self,
@@ -247,33 +287,41 @@ class AITestDesigner:
         requirement: str,
         criteria: List[Dict[str, str]],
         snapshots: Sequence[SnapshotResult],
+        progress: Progress = None,
     ) -> TestDesignResult:
-        current_json = json.dumps(
-            [tc.model_dump(mode="json", exclude={"version", "status"}) for tc in current.testcases],
-            ensure_ascii=False,
-        )
-        prompt = (
-            f"Revise the test cases of module '{self.module}' according to the reviewer.\n"
-            "Return the COMPLETE revised list. Keep `tc_id` for cases you keep or modify; use "
-            "null `tc_id` for new cases; omit cases the reviewer wants removed.\n\n"
-            "--- BEGIN UNTRUSTED REQUIREMENT DATA ---\n"
-            f"{requirement}\n\nAcceptance criteria:\n{_criteria_block(criteria)}\n"
-            "--- END UNTRUSTED REQUIREMENT DATA ---\n\n"
-            f"Current test cases (JSON):\n{current_json}\n\n"
-            f"--- BEGIN REVIEWER COMMENTS ---\n{comments}\n--- END REVIEWER COMMENTS ---\n\n"
-            "--- BEGIN UNTRUSTED PAGE SNAPSHOTS (ARIA trees) ---\n"
-            f"{_snapshots_block(snapshots)}\n--- END UNTRUSTED PAGE SNAPSHOTS ---\n"
-            f"{DESIGN_RULES}\n" + schema_instructions(TestDesignResult)
-        )
-        return await chat_structured(
-            self.llm,
-            [
-                {"role": "system", "content": TEST_DESIGN_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            TestDesignResult,
-            extra_check=lambda r: self._check_design(r, criteria),
-        )
+        batches = _batches(criteria)
+        batch_of = {c["id"]: i for i, batch in enumerate(batches) for c in batch}
+        groups: List[List[TestCase]] = [[] for _ in batches]
+        for tc in current.testcases:
+            groups[batch_of.get(tc.ac_ref, 0)].append(tc)
+
+        cases: List[DesignedCase] = []
+        notes: List[str] = []
+        for index, (batch, group) in enumerate(zip(batches, groups, strict=True), start=1):
+            await self._announce(progress, batch, index, len(batches))
+            current_json = json.dumps(
+                [tc.model_dump(mode="json", exclude={"version", "status"}) for tc in group],
+                ensure_ascii=False,
+            )
+            prompt = (
+                f"Revise the test cases of module '{self.module}' according to the reviewer.\n"
+                "Return the COMPLETE revised list. Keep `tc_id` for cases you keep or modify; use "
+                "null `tc_id` for new cases; omit cases the reviewer wants removed.\n\n"
+                "--- BEGIN UNTRUSTED REQUIREMENT DATA ---\n"
+                f"{requirement}\n\nAcceptance criteria:\n{_criteria_block(criteria)}\n"
+                "--- END UNTRUSTED REQUIREMENT DATA ---\n\n"
+                f"Current test cases (JSON):\n{current_json}\n\n"
+                f"--- BEGIN REVIEWER COMMENTS ---\n{comments}\n--- END REVIEWER COMMENTS ---\n\n"
+                "--- BEGIN UNTRUSTED PAGE SNAPSHOTS (ARIA trees) ---\n"
+                f"{_snapshots_block(snapshots)}\n--- END UNTRUSTED PAGE SNAPSHOTS ---\n"
+                f"{_batch_note(batch, index, len(batches))}"
+                f"{DESIGN_RULES}\n" + schema_instructions(TestDesignResult)
+            )
+            result = await self._design_call(prompt, batch)
+            cases.extend(result.testcases)
+            if result.notes:
+                notes.append(result.notes)
+        return TestDesignResult(testcases=cases, notes="\n".join(notes) or None)
 
 
 def build_collection(
